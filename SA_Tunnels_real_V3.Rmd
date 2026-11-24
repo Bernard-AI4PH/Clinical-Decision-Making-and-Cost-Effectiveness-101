@@ -1,0 +1,2067 @@
+---
+title: 'Kidney transplantation vs dialysis among elderly people: Markov based analysis'
+#subtitle: "Version-221126"
+author: "Anukul Ghimire, Bernard Asante."
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+  pdf_document:
+    toc: true
+  word_document:
+    toc: true
+---
+
+<!-- **Coding notes for tracking provided Templates** -->
+
+<!--   - Sections 01–09 are the main model (`ECD_DCD_tunnel_cSTM_ageing__V2.Rmd`)  -->
+<!--   - Sections 10–12: deterministic and probabilistic sensitivity-analysis  through `Functions_SA_Tunnels.R` -->
+<!--   - This main model follows the DARTH tunnel template (`Tunnel_example.Rmd`) provided in our decision analysis course -->
+
+We used a template developed by the Decision Analysis in R for Technologies in Health (DARTH) workgroup.  The authors thank the Decision Analysis in R for Technologies in Health (DARTH) workgroup for providing the coding framework in R. We also appreciate  Dr. David Neimark,Dr. Petros Pechlivanoglou, Dr. Beate Sander and Dr. Harindra Wijeysundera for sharing their expertise. 
+
+
+General idea: 
+We considered people who are being treated with in-center hemodialysis, on the kidney transplant waitlist, and aged 75. They get offered a death after circulatory criteria (DCC or DCD), expanded criteria donor (ECD) kidney transplant. They can either continue with in-center hemodialysis or undergo DCD ECD kidney transplantation. Horizon= lifetime. 
+
+Our main model does not consider waiting time or different dialysis modalities (PD/home hemodialysis). In addition, everyone starts off on dialysis, so we do not account for preemptive transplantation (which is likely not a limitation since we rarely ever use ECD kidneys for preemptive transplantation). 
+
+We are planning to write some code to consider a scenario analysis where people enter this model at different ages (example age: 80, 85, etc.) but for now assume everyone is age 75. We added aging using the life table from Stats Canada. 
+
+Dialysis has two states- Dialysis or death (we do not assume that they get offered a kidney transplant after). 
+
+Transplant has many tunnel states including graft function in the first 3 months, compared to months 4 to 12, compared to months 13+. In addition, if they experience graft loss, they enter the graft loss states which includes the first year of graft loss (GL months 1-12) where the risk of death is much higher compared to graft loss after month 13. 
+
+This is a progressive model, so people in the transplant strategy all start off in a functioning graft state and can transition to the next graft function month, graft loss, or death. People who experience graft loss can only transition to death or stay in the graft loss state. Death is absorbing. 
+
+
+**Model Conceptualization**
+
+```{r}
+# This template was designed using elements from decision analysis lectures on conceptualizing a model. 
+df_concept <- data.frame(
+  Element = c("Decision problem",   # The problem at hand 
+              "Type of Economic Evaluation", # This can be Cost-utility analysis (CUA) or Cost-effectiveness analysis (CEA) etc 
+              "Disease",                # Specific disease/health problem of interest
+              "Scope and structure",    # How many diseases, simple decision tree or a complex model(eg: decision tree with  Markov Model) and whether subtrees will be used or not. 
+              "Analytic perspective",   # Health outcome perspective, can be payers perspective etc
+              "Target population",    # The  population whom the model is about. It can be children, older adults, young adults, pregnant women etc. 
+              "Comparators",  # This focuses more on strategies(interventions) that will be used. They are usually seen as direct extensions from the decision node
+              "Outcomes",  # This is outcome of interest (QALY,Cost etc)
+              "Time horizon"), # Unit of time measurement in the model eg: Life expectancy in years 
+  `Kidney transplant Vs Dialysis problem` = c(
+    "To determine whether ECD/DCD Kidney transplatation or Dialysis should be used in older adults who are 75+ after kidney failure ",
+    "This is Cost Utility Analysis making use of QALY and Cost but we added Life expectancy",
+    "Kidney Failure",
+    "This model used MArkov process with tunnel states including Deterministic Sensitivity Analysis(DSA) and Probabilistic Sensitivity Analysis(PSA)",
+    "Canadian public-payer perspective, 2025 CAD",
+    " Populations >= 75-year-old adults",
+    "Continued Dialysis, ECD/DCD transplant",
+    "Life Expectancy, QALY, ICER, NMB",
+    "Lifetime(35 years with Monthly Cycles"),
+  check.names = FALSE
+)
+
+knitr::kable(df_concept, caption = "Conceptualising the model")
+```
+
+
+```{r, echo=FALSE, out.width="80%", fig.align="center", fig.cap="Markov model diagram"}
+knitr::include_graphics("Markov_Model.png")
+```
+
+
+<!-- P: 75-year-old person being treated with dialysis for kidney failure, and is on the kidney transplant waitlist. -->
+<!-- I: Offered an expanded criteria donor (ECD) kidney from a donor after circulatory death (DCD). -->
+<!-- C: Remain on dialysis -->
+<!-- O: Survival, QALY, and ICER -->
+<!-- T: Time zero is the offer. Lifetime horizon. Monthly cycles. Age dependent probability of death using StatCan lifetables for people in Canada aged 75-110.  -->
+
+States with strategies:
+
+1.  Continued dialysis: Dialysis, Dead (2 states)
+2.  ECD/DCD transplant:  12 graft tunnels (G_1Mo to G_12Mo), a graft holding state (G_13Mo+), 12 graft-loss tunnels  (GL_1Mo to GL_12Mo), graft-loss holding state (GL_13Mo+), and Dead (27 states).
+
+Death rates rise with age: each death rate = general population death rate at the person's current age (derived from Statistics Canada life table) + a constant extra rate for the state (calibrated using 5 year survival probabilities published in recent ERA study BMJ 2026: PMID: 42759976) 
+
+Graft-loss--> death p values do not change with age in first year of GL: P is 0.05644 from Vanhove et al 2022 which is already 6 times the dialysis rate at 75. After first year of GL, then p values = dialysis rate accounted for aging 
+
+
+
+<!-- Key considerations and steps:  -->
+
+<!-- | 02 | `calc_surv_tx()` follows the rising background death rate month by month, and solves for the extra death rate with a graft (`r_G_exc`)  -->
+<!-- | 03.1 Step 0 | read the Statistics Canada life table (ages 75–109) and turn it into 420 monthly background death rates -->
+<!-- | 03.1 Step 1 Dialysis death = background + calibrated extra rate (caibrated to 55% alive at 5 years for dialysis) | -->
+<!-- | 03.1 Step 2 | Early death (graft months 1–3) = 3 × the dialysis rate at that age -->
+<!-- | 03.1 Steps 3–4 | Monthly graft-loss probabilities (`p_GL_y1`, `p_GL_y2p`) stored once; graft loss itself does not change with age -->
+<!-- | 03.1 Step 5 Death after graft loss in the first year can never be lower than dialysis -->
+<!-- | 03.1 Step 6 | Calibrates the extra death rate with a working graft (calibrated to 59% alive at 5 years for transplant)  -->
+<!-- | Transition probabilities | Death probabilities are vectors of 420 values (one per month) and matrices of 13 tunnel positions × 420 months | -->
+<!-- | 04.3 | Arrays filled with a different value in each cycle; new check that no state dies more slowly than the general population | -->
+<!-- | 06 | General-population survival added to the plot and tables; new checks (alive at end, median survival) | -->
+
+
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, eval = TRUE)
+```
+
+
+```{r}
+rm(list = ls())      # clear memory (removes all the variables from the workspace)
+```
+
+# **01 Load packages**
+
+```{r}
+if (!require('pacman')) install.packages('pacman'); library(pacman) # use this package to conveniently install other packages
+# load (install if required) packages from CRAN
+p_load("dplyr", "tidyr", "reshape2", "devtools", "scales", "ellipse", "ggplot2", "lazyeval", "igraph", "truncnorm", "ggraph", "reshape2", "knitr", "stringr", "diagram", "dampack", "ggthemes")
+# load (install if required) packages from GitHub
+# install_github("DARTH-git/darthtools", force = TRUE) #Uncomment if there is a newer version
+p_load_gh("DARTH-git/darthtools")
+```
+
+# **02 Load functions**
+
+```{r}
+# all DARTH functions are in the darthtools package (rate_to_prob, gen_wcc, check_transition_probability, check_sum_of_transition_array, plot_trace)
+
+# Function used to calibrate the death rate with a functioning graft (section 03.1, Step 6).
+
+# Aging
+# Without aging (in our previous model) input was one constant annual death rate with a working graft, so the same 27 x 27 matrix was used in every month.
+# With aging, the input is the addition annual death rate with a working graft (r_G_exc), added on top of the general-population rate at each month's age. Because the background rate changes every month, the 27 x 27 matrix is now inside the monthly loop (one matrix per month)
+
+# BMJ 2026 study showed that people with a transplant have three times the death compared to those who continue on dialysis in the first 3 months. If people with a working graft (month 4+) die at population rate at their age + r_G_exc", what % of transplant recipients remain alive at 5 years? uniroot() (Step 6) calls it repeatedly with different r_G_exc until the answer is 59% (as per BMJ study)
+
+#Tunnel names are built inside the function so it does not depend on section "Tunnels".
+# --------------------------------------------------------------------------
+
+calc_surv_tx <- function(r_G_exc, n_months = 60) {
+  # Two inputs: the extra death rate with a graft (per year) and the number of months to run (60 = 5 years, the Hellemans time point)
+  n_tun <- 13   # 12 monthly tunnels + 1 holding state = 13 per group
+
+  # Step 1: state names (13 graft, 13 graft loss, Dead = 27) in transplant strategy 
+  v_G   <- c(paste0("G_",  1:12, "Mo"), "G_13Mo+")    # graft state names
+  v_GL  <- c(paste0("GL_", 1:12, "Mo"), "GL_13Mo+")   # graft-loss state names
+  v_nm  <- c(v_G, v_GL, "Dead")                       # all 27 names, used as row and column names
+
+  # Step 2: starting distribution: everyone in G_1Mo at time 0
+  v_m <- matrix(c(1, rep(0, length(v_nm) - 1)), nrow = 1)
+
+  # Step 3: loop over months; probabilities are recalculated for each month t because the background death rate (v_r_pop_m[t]) depends on age
+  for (t in 1:n_months) {
+
+    # Death with a graft in month t: different in months 1-3, then 4 months +
+    p_early <- v_p_G1to3_dead[t]                                              # months 1-3: 3 x dialysis rate at this age (see section 3 to see how this vector derived: accounts for aging V-r_pop_m
+    p_late  <- rate_to_prob(r = v_r_pop_m[t] + r_G_exc, time = cycle_length)  # month 4+: population rate + extra rate
+    v_p_dead <- c(rep(p_early, 3), rep(p_late, 10))                           # 13 values, one per graft position (first 3 months= 3 positions, months 4-12= 9 positions, and months 13+)
+
+    # Graft loss in month t, conditional surviving the month (different months 1-3, 4+)
+    v_p_gl <- c(rep((1 - p_early) * p_GL_y1, 3),    # graft months 1-3  (year-1 graft-loss rate)
+                rep((1 - p_late)  * p_GL_y1, 9),    # graft months 4-12 (year-1 graft-loss rate)
+                    (1 - p_late)  * p_GL_y2p)       # graft month 13+   (rate from month 13)
+
+    # Death after graft loss in month t (different year 1 vs beyond year 1)
+    v_p_gld <- c(rep(v_p_GL1to12_dead[t], 12),      # first 12 months after graft failure
+                 v_p_GL13p_dead[t])                 # 13+ months after failure (= dialysis at this age)
+
+    # Build this month's 27 x 27 transition matrix (same loop as section 04.3)
+    m_P <- matrix(0, nrow = length(v_nm), ncol = length(v_nm), dimnames = list(v_nm, v_nm))
+    for (i in 1:n_tun) {
+      to_G  <- v_G[min(i + 1, n_tun)]    # next graft tunnel (or stay in G_13Mo+)
+      to_GL <- v_GL[min(i + 1, n_tun)]   # next graft-loss tunnel (or stay in GL_13Mo+)
+      m_P[v_G[i], to_G]      <- 1 - v_p_dead[i] - v_p_gl[i]   # survive with graft
+      m_P[v_G[i], "GL_1Mo"]  <- v_p_gl[i]                     # lose graft (always to GL_1Mo)
+      m_P[v_G[i], "Dead"]    <- v_p_dead[i]                   # die with graft
+      m_P[v_GL[i], to_GL]    <- 1 - v_p_gld[i]                # survive after graft loss
+      m_P[v_GL[i], "Dead"]   <- v_p_gld[i]                    # die after graft loss
+    }
+    m_P["Dead", "Dead"] <- 1
+
+# Move the cohort forward one month below. v_m: a row of 27 numbers representing the % of the cohort in each state (G_1Mo … G_13Mo+, GL_1Mo … GL_13Mo+, Dead) at the start of the month. 
+# m_P: this month's 27 × 27 transition matrix. Row = where people are now, column = where they go. Each row adds to 1.
+    v_m <- v_m %*% m_P
+  }
+  as.numeric(1 - v_m[1, length(v_nm)])   # proportion alive (graft + graft loss) after n_months
+}
+```
+
+# **03 Model input(parameterss)**
+
+```{r}
+# General
+cycle_length    <- 1/12                          # cycle length equal to one month
+n_cycles        <- 420                           # number of cycles: 35 years x 12 (age 75 to 110; lifetime)
+v_names_cycles  <- paste("cycle", 0:n_cycles)    # cycle names
+age_start       <- 75                            # age at time zero
+age_end         <- age_start + n_cycles * cycle_length - 1   # last age with transitions = 109
+
+#Each strategy has diff states, because people who continue dialysis can never be in a graft or graft-loss state.
+v_names_states_dial <- c("Dialysis", "Dead")     # state names for continued dialysis
+n_states_dial       <- length(v_names_states_dial)
+
+# The transplant state names (with tunnels) are created in "Tunnels" below.
+
+# Discounting factors
+# 1.5% per year for costs and QALYs, as per CADTH [9].
+d_c <- 0.015        # annual discount rate for costs
+d_e <- 0.015        # annual discount rate for QALYs
+
+# Strategies
+# save strategy names (reference first= continued dialysis)
+v_names_str     <- c("Continued dialysis",
+                     "ECD/DCD transplant")
+
+n_str           <- length(v_names_str)  # number of strategies
+
+# Within-cycle correction (WCC) using Simpson's 1/3 rule
+v_wcc <- gen_wcc(n_cycles = n_cycles,  method = "Simpson1/3")
+# Simpson's 1/3 rule is used to approximate the area under a curve.
+
+```
+
+## 03.1 Calculation of transition probabilities
+
+This section :
+(1) Described where every probability comes from.  Published results are given as survival percentages or hazard ratios over years.
+(2) Each survival % or HR is first turned into an annual rate, and then into a monthly
+probability. A rate is used because it can be divided over time; percentages cannot.
+
+- Survival over t years with a constant rate r: S(t) = exp(-r t), so r =
+  -ln(S(t)) / t
+- Monthly probability: p = 1 - exp(-r / 12), done by
+  `rate_to_prob(r, time = cycle_length)`
+
+
+-Death rates change every month, because the general-population death rate rises with age
+- Death rate in a state at any month t = population rate (at the person's
+  age) in month t + a constant extra rate for that state.
+- The extra rates are calibrated so 5-year survival still matches Hellemans (55% dialysis, 59% transplant).
+- Extra rate cannot be negative= thus, no state can die slower than general population
+- Death probabilities therefore become vectors of 420 values (one per month aka one per cycle) instead of single numbers. 
+-Names starting with v_p_ are vectors; names starting with p_ are single numbers.
+
+```{r}
+# Step 0: Background (general-population) mortality using Statistics Canada complete life table for Canada, age 75-110, both sexes, three-year estimates 2022/2024 (preliminary), download as displayed 
+# Element = Death probability between age x and x+1 (qx)
+# The CSV must be in the same folder as this .Rmd file.
+
+# Read the whole file but it has title lines and footnotes, so we do not rely on line numbers; we keep only rows whose first column looks like "75 years".
+lt_raw <- read.csv("Life_Table_StatsCan_75years.csv", header = FALSE,
+                   col.names = c("age_group", "qx"), # age label and death probability columns
+                   fileEncoding = "UTF-8-BOM", stringsAsFactors = FALSE)
+
+lt <- lt_raw[grepl("^[0-9]+ years", lt_raw$age_group), ]   # keep the age rows only ("75 years" ... "110 years and over"). ^: label must start here and 0-9 is one or more digits. Space and then "years". Sp 75 years, 76 years, etc kept. , means these rows and all columns
+lt$age <- as.numeric(sub(" years.*", "", lt$age_group))      # "75 years" -> 75; "110 years and over" -> 110
+lt$qx  <- as.numeric(lt$qx)                                   # text -> number
+nrow(lt)                                                      # should be 36 (ages 75 to 110)
+head(lt[, c("age", "qx")], 3)                                 # 75 0.02405, 76 0.02663, 77 0.02951
+
+# Keep ages 75 to 109: the model's 420 monthly cycles cover ages 75.0 to 109 (35 years). The "110 years and over" row (qx = 1) is the end of the life table; the model stops at age 110.
+v_q_pop <- lt$qx[lt$age >= age_start & lt$age <= age_end]     # 35 yearly death probabilities
+stopifnot(length(v_q_pop) == n_cycles * cycle_length) # stops with an error if not 35
+length(v_q_pop) # 35
+
+# Yearly probability -> yearly rate (rates can be added and divided over months). Key rate can be added (rate of death in gen pop + on dialysis, but prob can't be added because can exceed 1 and double count. Rate can also be converted years to months by dividing 12)
+# Below is reverse to rate_to_prob().
+v_r_pop <- -log(1 - v_q_pop)   # 35 yearly rates; age 75: -log(1 - 0.02405) = 0.0243
+head(v_r_pop) # 0.02434392 0.02699100 0.02995418 0.03329829 0.03705825 0.0412908
+
+# Above is rate per year but need one value per month: repeat each age's rate 12 times--> rep(v_p_HD, each = 1/cycle_length)). Key same rate/prob for all months in any given age year
+v_r_pop_m <- rep(v_r_pop, each = 1 / cycle_length)            
+# 420 values; months 1-12 = age 75, months 13-24 = age 76, ...
+
+v_p_pop_m <- rate_to_prob(r = v_r_pop_m, time = cycle_length) # monthly death probability, general population
+# month 1 (age 75): 0.00203; month 420 (age 109): 0.0572
+
+#Step 1A: Death on continued dialysis
+# Hellemans et al. [1] Target trial emulation, waitlisted patients--> ECD/DCD vs dialysis comparison at age 75): 5-year survival, 55% (95% CI 54% to 55%) for dialysis
+
+# Without aging: one constant rate, r_dial_dead = -log(0.55)/5 = 0.1196 per year.
+# With aging: dialysis death rate in month t = population rate(t) + r_dial_exc.
+
+# Key 55 % alive at 5 years, so total risk at 5 years is -ln(0.55)= 0.598. Gen population 75-79 is 0.152. So 0.446 is left for extra risk and so this must add to 0.446 over the extra years. We divide this by 5 = 0.0892 per year. 
+#Then we add this to vector of gen popultion to get vector for dialysis, and then do rate--> prob
+
+# How r_dial_exc is found S(5 years) = exp( - sum over months 1-60 of [rate(t) x 1/12] ) = 0.55
+#   so  sum over 60 months of [population rate(t) + r_dial_exc] x 1/12 = -log(0.55)
+#   so  r_dial_exc = ( -log(0.55) - sum(population rates, months 1-60) x 1/12 ) / 5
+# -log(0.55) = 0.598 is the total 5-year "dose" of risk; the population provides 0.152 of it (ages 75-79); the rest, spread over 5 years, is the extra risk of being on dialysis.
+r_dial_exc    <- (-log(0.55) - sum(v_r_pop_m[1:60]) * cycle_length) / 5   # = 0.0892 per year (extra rate on dialysis)
+v_r_dial_dead <- v_r_pop_m + r_dial_exc                                    # 420 annual rates, rising with age
+v_p_dial_dead <- rate_to_prob(r = v_r_dial_dead, time = cycle_length)      # 420 monthly probabilities
+# month 1 (age 75): 0.00942; month 60 (age 79): 0.01047; month 420 (age 109): 0.0642
+prod(1 - v_p_dial_dead[1:60])   # check: share alive on dialysis at 5 years, should print 0.55
+
+#Step 1B: Death more than 12 months after graft loss
+# People are back on long-term dialysis, so they get the same death probability as continued dialysis, at the same age.
+v_p_GL13p_dead <- v_p_dial_dead         
+
+#Step 2: Death in graft months 1-3 (early post-transplant death)
+# Hellemans et al. [1]: in recipients aged 75, the peak early post-transplant all-cause mortality hazard vs continued dialysis was 3x higher after ECD/DCD transplantation.
+# Leeaphorn et al. [2]: hazard ratio 2.29 for days 0-90 in US waitlisted patients aged >=75 (lower value for sensitivity analysis).
+# The 3-month window matches days 0-90 in [2] and the cost periods in [5].
+#Both Hellmans and Leeaphorn are target trial emulation studies
+
+hr_early        <- 3.0    # early hazard ratio vs dialysis
+v_r_G1to3_dead  <- hr_early * v_r_dial_dead                                 
+v_p_G1to3_dead  <- rate_to_prob(r = v_r_G1to3_dead, time = cycle_length)  
+head(v_p_G1to3_dead ) # # month 1: 0.02800 per month
+
+
+# Step 3: Graft loss in year 1 (graft months 1-12) ---------------------
+# Schachtner et al. [3] (Eurotransplant Senior Program, recipients and donors >=65; likely DBD kidneys, Germany): death-censored graft survival 93.3% at 1 year. "Death-censored" means deaths with a working graft are not counted as graft loss, which is what we need because death is a separate transition in our model.
+# Limitation: No 1-year value is reported for DCD kidneys in recipients >=65 (95.5% in younger recipients of older DCD kidneys [14]; sensitivity analysis: r_GL_y1 <- -log(0.955)).
+#The negative-log conversion is correct under the assumption of a constant graft-failure hazard during the first year:
+r_GL_y1 <- -log(0.933)        # 0.0694 annual hazard rate (per year)
+# Graft loss does not change with age in our model (no age-specific data).
+
+# monthly graft-loss probability among people alive with a graft, stored once so it can be reused below and in calc_surv_tx()
+p_GL_y1 <- rate_to_prob(r = r_GL_y1, time = cycle_length)   # 0.00576 per month
+# Only people who survive the month can lose their graft, so graft loss is applied to survivors: (1 - p_dead) x p_graft loss. This is the same pattern as the template's healthy row: (1 - p_HD) x p_HS1.
+v_p_G1to3_GL <- (1 - v_p_G1to3_dead) * p_GL_y1  
+
+# Step 4: Graft loss from month 13 onward 
+# Year 1: death-censored graft survival 93.3% (Schachtner et al. [3]).
+# Year 3: death-censored graft survival 86.6% with controlled DCD kidneys,
+#   recipients >=65 (mean age 70.6; donors mean 70.9) (Perez-Saez et al. [13]).
+# Graft survival from year 1 to year 3 = 0.866 / 0.933 = 0.9282 (conditional on a working graft at 1 year). Spread over those 2 years:
+r_GL_y2p <- -log(0.866 / 0.933) / 2   # /2 because 2 years (year 1-3) = 0.0373 per year
+# Conditional on a working graft at 1 year (the division) and on the patient being alive (death-censored data).
+# Held constant for life. Check: gives 80.4% death-censored graft survival at 5 years, consistent with
+#   82.8% (UK DCD, donors >60; Summers et al. [16]); 66.7% at 10 years vs 70.4% in [3] (slightly pessimistic).
+# Sensitivity: -log(0.826 / 0.933) / 4 = 0.0305 per year (82.6% at 5 years, DBD old-for-old [3]).
+p_GL_y2p <- rate_to_prob(r = r_GL_y2p, time = cycle_length)  
+# The probability of graft loss for month 13+ also needs the death probability with a graft, which is calibrated in Step 6, so it is finished in "Transition probabilities".
+
+# Step 5: Death in the first year AFTER experiencing graft loss
+# Vanhove et al. [4] (US SRTR): 50.2% one-year mortality after graft failure at age >=75. Monthly survival s with s^12 = 1 - 0.502:
+p_GL1to12_dead <- 1 - (1 - 0.502)^(1/12)      # = 0.05644 per month
+# (identical to rate_to_prob(r = -log(1 - 0.502), time = cycle_length))
+# Every graft loss (from any graft state) enters GL_1Mo, because this risk is measured from the date of graft failure (rather than time post transplant)
+
+# This value is for people aged >=75, and is kept constant (in the first year of graft loss). However, it should neve fall below the dialysis death probability at the same age. ex. someone who has just lost a graft at age 99 should not be at lower risk than someone at the same age who is in the dialysis startegy arm. Idea is that first year of GL is associated with sig morbidity (inflammation from cause of GL, risk of infections from IS, etc). Thus, need a way to compare the two probabilitis and take the larger one. Should the alternative be a scenario analysis?
+#pmax() takes the larger of the two, month by month. 
+v_p_GL1to12_dead <- pmax(p_GL1to12_dead, v_p_dial_dead)   # 420 values
+
+# Key at what age does probability of death on dialysis (accounting for age) exceed probability of death after GL? 
+
+v_floor   <- v_p_dial_dead > p_GL1to12_dead                    # TRUE in months where pmax() picks dialysis
+n_m_first <- which(v_floor)[1]   # first such month
+n_m_first # 385 months 
+
+# so it becomes true after 385 months of "aging" starting age 75, mean age 107 or so.
+
+# Step 6: Calibration of death with a functioning graft (month 4+)
+# Hellemans et al. [1] report 59% (95% CI 51% to 66%) alive 5 years after ECD/DCD transplantation at age 75, but no death rate for people with a working graft only (excluding those with GL) after the early period. That rate is the only unknown in the transplant arm, so we search for the value that makes the model's 5-year survival (alive with a graft + alive after graft loss) = 59%.
+
+
+# Without aging: searched for one constant death rate with a graft
+# With aging:    death rate with a graft in month t = population rate(t) + r_G_exc;
+#                 uniroot() searches for the EXTRA rate r_G_exc.
+#                 The search starts at 0, so the extra rate cannot be negative:
+
+target_surv5_tx <- 0.59
+
+r_G_exc <- uniroot(function(r) calc_surv_tx(r_G_exc = r, n_months = 60) - target_surv5_tx,
+                   interval = c(0, 1), tol = 1e-10)$root  # 0.0419 per year (extra rate with a working graft)
+
+#This creates a temporary function where r represents a possible extra death rate. Using uniroot, R will try different values of r and calculate the corresponding 5-year survival.
+#uniroot() returns several pieces of information, but $root extracts the actual answer: the value of r that makes the equation equal zero.
+#Key: -target_surv5_tx subtracts our target from 0.59 to get 0, which has to be in interval (0,1), with a tolerance of 1e-10 difference. 
+
+# Monthly death probability with a working graft (month 4+): a vector, rising with age
+v_p_G4p_dead <- rate_to_prob(r = v_r_pop_m + r_G_exc, time = cycle_length)   # month 4: 0.00551; month 60: 0.00656
+
+# Check: model 5-year survival after transplant
+calc_surv_tx(r_G_exc = r_G_exc, n_months = 60) # 0.59
+
+# Comparison of the extra rates (per year): dialysis 0.0892, working graft 0.0419.
+c(r_dial_exc = r_dial_exc, r_G_exc = r_G_exc)
+```
+
+### 03.2 Transition probabilities (monthly)
+
+```{r}
+# 
+# With aging, death probabilities are now vectors of 420 values (one per month). 
+# P of Graft loss among survivors (p_GL_y1, p_GL_y2p) is constant and not age dependent per se,  but because it is multiplied by (1 - p_dead), the final graft-loss probabilities are also vectors (to account for changes in the competing risk of death as you age)
+# head(x, 3) shows the first 3 months; x[60] shows month 60 (age 79).
+
+#Continued dialysis -> death
+head(v_p_dial_dead, 3)     # 0.00942 ... (= population + extra rate on dialysis)
+
+#Graft months 1-3
+head(v_p_G1to3_dead, 3)    # 0.02800 ... (= 3 x dialysis rate at that age)
+head(v_p_G1to3_GL, 3)      # 0.00560 ... -> GL_1Mo
+
+# Graft months 4-12
+v_p_G4to12_dead <- v_p_G4p_dead                               # population + calibrated extra rate
+v_p_G4to12_GL   <- (1 - v_p_G4to12_dead) * p_GL_y1            # graft loss among survivors
+
+# Graft month 13+
+v_p_G13p_dead   <- v_p_G4p_dead             # same calibrated death probability as v_p_G4to12_dead
+v_p_G13p_GL     <- (1 - v_p_G13p_dead)   * p_GL_y2p   # graft loss among survivors, rate from month 13
+# (1 - v_p_G13p_dead) makes graft loss conditional on surviving this month
+
+# Graft loss to death, months 1-12 and month 13+
+head(v_p_GL1to12_dead, 3)  # 0.05644 ... (Vanhove et al. 2022; never below dialysis)
+head(v_p_GL13p_dead, 3)    # 0.00942 ... (same as continued dialysis)
+
+# State-residence and time dependent
+#
+# Without aging: vectors of 13 values, one per tunnel position (like v_p_SD in the template).
+# With aging:    MATRICES with 13 rows (tunnel position: month since transplant or since graft loss) and 420 columns (model month = age).. Row i, column t = probability for tunnel position i in model month t.
+#  matrix(v, nrow = 3, ncol = n_cycles, byrow = TRUE) repeats the  420-value vector v as 3 identical rows.
+# So total you have 420 columns (for each cycle) and 13 rows (for aeach position)
+
+m_p_G_dead  <- rbind(matrix(v_p_G1to3_dead,  nrow = 3, ncol = n_cycles, byrow = TRUE),   # rows 1-3:  graft months 1-3
+                     matrix(v_p_G4to12_dead, nrow = 9, ncol = n_cycles, byrow = TRUE),   # rows 4-12: graft months 4-12
+                     v_p_G13p_dead)                                                       # row 13:    graft month 13+
+
+m_p_G_GL    <- rbind(matrix(v_p_G1to3_GL,    nrow = 3, ncol = n_cycles, byrow = TRUE),
+                     matrix(v_p_G4to12_GL,   nrow = 9, ncol = n_cycles, byrow = TRUE),
+                     v_p_G13p_GL)
+m_p_GL_dead <- rbind(matrix(v_p_GL1to12_dead, nrow = 12, ncol = n_cycles, byrow = TRUE),  # rows 1-12: first year after graft loss
+                     v_p_GL13p_dead)                                                      # row 13:    13+ months after graft loss
+dim(m_p_G_dead)                 # 13 420
+round(m_p_G_dead[, 1:13], 5)     # first 12 months for every graft position rounded to 5 decimals 
+ # Notice that columns 1–12 are the 12 months of age 75, and nothing in the death probabilities changes within a year of age. Across the columns (months 1–12): every death probability is built from the population rate plus fixed extra rates. The population rate is repeated for all 12 months of each age
+# So you don't see the change until column 13 (13th month)
+# These are just probabilities (not proportion in each state)
+
+```
+
+### 03.3 Tunnels
+
+```{r}
+# Tunnels
+n_tunnel_size <- nrow(m_p_G_dead) # >>> number of ROWS = 13 (12 monthly tunnels + 1 holding state)
+
+# Graft states (time since transplant)
+v_Graft_tunnel <- c(paste("G_", seq(1, n_tunnel_size - 1), "Mo", sep = ""), paste("G_", n_tunnel_size, "Mo+", sep = ""))
+# Result: "G_1Mo" "G_2Mo" ... "G_12Mo" "G_13Mo+"
+# G_1Mo to G_12Mo are true tunnel states (one cycle each, then move on).
+# G_13Mo+ is the holding state: survivors stay there from month 13 onward.
+#Sep ="" means no space between them
+
+# Graft-loss states (time since graft failure)
+v_GL_tunnel <- c(paste("GL_", seq(1, n_tunnel_size - 1), "Mo", sep = ""), paste("GL_", n_tunnel_size, "Mo+", sep = ""))
+# Result: "GL_1Mo" "GL_2Mo" ... "GL_12Mo" "GL_13Mo+"
+
+# Create variables for time-dependent model (transplant strategy)
+v_names_states_tunnels_tx <- c(v_Graft_tunnel, v_GL_tunnel, "Dead")# 27 state names because 13 in V_Graft_tunnel, 13 in V_GL_tunnel each, and then one death state
+n_states_tunnels_tx       <- length(v_names_states_tunnels_tx)     # number of states
+```
+
+### 03.4 Rewards
+
+This section consist of parameters that wwere used for cost and utilities
+
+```{r}
+#State rewards 
+#Costs (not in template: costs are entered PER MONTH, so they are not multiplied by cycle_length in section 07)
+# Source: Ferguson et al. [5] (Canadian cost-utility model of dialysis) IN 2016 CAD;
+#Transplant costs in [5] come from Barnieh et al. [6] (Alberta analysis).
+
+#Below are Statistics Canada's all-items Consumer Price Index for Canada, annual averages, from Table 18-10-0005-01. The index is set so that 2002 = 100. Below we inflate 2016 CAD to 2025 CAD with the all-items Consumer Price Index [7]:
+
+cpi_2016 <- 128.4 ##2016 = 128.4: prices were 28.4% higher than in 2002.
+cpi_2025 <- 164.2 ##2025 = 164.2: prices were 64.2% higher than in 2002.
+k_cpi    <- cpi_2025 / cpi_2016 # 1.279 = inflation factor. Item that cost $1 in 2016 costs $1.28 in 2025.
+
+# Continued dialysis (and graft loss), per month [5]
+c_dial <- k_cpi * (50075.81 / 12 +                 # facility hemodialysis (per year / 12)
+                   6614.00  / 12 +                 # physician (per year / 12)
+                   5475.00  / 12 +                 # capital (per year / 12)
+                   157.89 +                        # erythropoietin (per month)
+                   5751.04  / 12 +                 # vascular access (per year / 12)
+                   0.028745 * 7389.67 +            # cardiovascular admissions (monthly probability x cost)
+                   0.0645   * 14763.60)            # other admissions (monthly probability x cost)
+# = $8,928.97 per month. Infection admissions are not included.
+
+# Hospital admissions in transplant recipients, per month [5]
+c_tx_hosp <- k_cpi * (0.003964 * 7389.67 + 0.0301 * 14763.60)  # $605.75 per month
+
+# Transplant follow-up, per month [5,6] (reported per 30 days, by period)
+c_G1to3   <- k_cpi * 10578.09 + c_tx_hosp          # days 0-90:   $14,133.18 per month
+c_G4to12  <- k_cpi * 3238.82  + c_tx_hosp          # days 91-360: $4,747.60 per month
+c_G13p    <- k_cpi * 2084.95  + c_tx_hosp          # later years: $3,272.01 per month
+c_GL      <- c_dial                                # back on dialysis after graft loss
+c_D       <- 0                                     # cost in the dead state (no end-of-life cost)
+
+# One-time cost at transplant (time zero) [5,6]: surgery plus half of the deceased-donor costs (one donor gives kidneys to two recipients)
+c_tx_once <- k_cpi * (26803.07 + 0.5 * (41624.78 + 235.19))   # $61,041.80
+
+#### Utilities (annual values; multiplied by cycle_length in section 07)
+# Ferguson et al. [5], from the meta-analysis by Wyld et al. [8]
+u_dial    <- 0.71  # utility on dialysis (SD 0.04)
+u_graft   <- 0.82  # utility with a functioning graft (SD 0.04);
+                   # consistent with EQ-5D-5L 0.83 at 6 months [11]
+# Graft months 1-3: no published utility. Li et al. [11] excluded their 90-day EQ-5D-5L as a recovery period; quality of life had improved by 6 months in [11] and [12]. Assumed equal to dialysis (conservative);
+# sensitivity analysis: 0.82 from month 1.
+u_G1to3   <- 0.71
+u_GL      <- 0.71  # back on dialysis after graft loss
+u_D       <- 0     # utility when dead
+
+### Discount weight for costs and effects
+v_dwc     <- 1 / ((1 + (d_c * cycle_length)) ^ (0:n_cycles))
+v_dwe     <- 1 / ((1 + (d_e * cycle_length)) ^ (0:n_cycles))
+# As in the template: the annual rate is divided by 12 and compounded
+# monthly (equivalent to 1.51% per year; 1/(1.015)^(t/12) is an
+# alternative that gives almost the same result).
+```
+
+# **04 Construct state-transition models**
+
+```{r}
+# This is a simplified diagram and not the actual code for the matrix we will use: tunnel states with the same probabilities are grouped into one box (the full model has 27 transplant states).
+v_names_diag <- c("Dialysis", "G 1-3", "G 4-12", "G 13+", "GL 1-12", "GL 13+", "Dead")
+m_P_diag <- matrix(0, nrow = length(v_names_diag), ncol = length(v_names_diag),
+                   dimnames = list(v_names_diag, v_names_diag))
+m_P_diag["Dialysis", "Dialysis"] = ""
+m_P_diag["Dialysis", "Dead"    ] = ""
+m_P_diag["G 1-3",    "G 4-12"  ] = ""
+m_P_diag["G 1-3",    "GL 1-12" ] = ""
+m_P_diag["G 1-3",    "Dead"    ] = ""
+m_P_diag["G 4-12",   "G 13+"   ] = ""
+m_P_diag["G 4-12",   "GL 1-12" ] = ""
+m_P_diag["G 4-12",   "Dead"    ] = ""
+m_P_diag["G 13+",    "G 13+"   ] = ""
+m_P_diag["G 13+",    "GL 1-12" ] = ""
+m_P_diag["G 13+",    "Dead"    ] = ""
+m_P_diag["GL 1-12",  "GL 13+"  ] = ""
+m_P_diag["GL 1-12",  "Dead"    ] = ""
+m_P_diag["GL 13+",   "GL 13+"  ] = ""
+m_P_diag["GL 13+",   "Dead"    ] = ""
+m_P_diag["Dead",     "Dead"    ] = ""
+layout.fig <- c(1, 3, 2, 1)   # boxes per row: Dialysis; 3 graft groups; 2 graft-loss groups; Dead
+plotmat(t(m_P_diag), pos = layout.fig, self.cex = 0.5, curve = 0, arr.pos = 0.8,
+        latex = FALSE, arr.type = "curved", relsize = 0.85, box.prop = 0.6,
+        cex = 0.7, box.cex = 0.6, lwd = 1)
+# Continued dialysis uses only Dialysis and Dead; the transplant strategy
+# starts in "G 1-3" (G_1Mo). The structure is unchanged by ageing; only the
+# death probabilities now differ by month.
+```
+
+## 04.1 Initial state vectors
+
+```{r}
+# Continued dialysis
+v_m_init_dial <- c(1, 0) #everyone starts on dialysis
+names(v_m_init_dial) <- v_names_states_dial #"dialysis" and "dead"
+
+# ECD/DCD transplant
+v_m_init_tunnels_tx <- c(1, rep(0, n_states_tunnels_tx - 1)) #everyone starts in first graft tunnel (G_1Mo)
+names(v_m_init_tunnels_tx) <- v_names_states_tunnels_tx # c(v_Graft_tunnel, v_GL_tunnel, "Dead")
+```
+
+## 04.2 Initialize cohort traces with tunnels
+
+```{r}
+# Initialize cohort trace for continued dialysis (no tunnels needed for dialysis strategy)
+m_M_dial <- matrix(0,
+                   nrow     = (n_cycles + 1), ncol = n_states_dial,
+                   dimnames = list(0:n_cycles, v_names_states_dial))
+# So this gives you a matrix with 421 rows (cycles 0-420) and 2 columns (dialysis, dead) with all cells =0
+
+# Store the initial state vector in the first row of the cohort trace
+m_M_dial[1, ] <- v_m_init_dial #So now cell in row one under "dialysis" is 1, dead is 0.
+
+### Initialize cohort trace for state-residence dependent cSTM under transplant
+m_M_tunnels_tx <- matrix(0,
+                         nrow     = (n_cycles + 1), ncol = n_states_tunnels_tx,
+                         dimnames = list(0:n_cycles, v_names_states_tunnels_tx))
+m_M_tunnels_tx[1, ] <- v_m_init_tunnels_tx #All cells zero except G_1mo
+```
+
+## 04.3 Create transition probability arrays
+
+```{r}
+# Create transition probability array for continued dialysis. These are just probabilities and do not contain info on share of cohort in each state (that is section 5)
+a_P_dial <- array(0,
+                  dim      = c(n_states_dial, n_states_dial, n_cycles),
+                  dimnames = list(v_names_states_dial, v_names_states_dial,
+                                  v_names_cycles[-length(v_names_cycles)]))
+
+#Above creates empty array. Below, start filling it in with probabilities
+
+# v_p_dial_dead is a vector of 420 values, so each cycle's slice gets its own value 
+# The blank third index fills slice 1 with value 1, slice 2 with value 2, etc.
+a_P_dial["Dialysis", "Dialysis", ] <- 1 - v_p_dial_dead
+a_P_dial["Dialysis", "Dead", ]     <-     v_p_dial_dead
+a_P_dial["Dead", "Dead", ]         <- 1
+a_P_dial[, , c(1, 60, 420)]   # prints 3 slices of array (2 x 2 matrix with transition array for each month chosen: ages 75, 79, 109 (month 1, 60, 420)
+
+# Create transition probability array for the transplant strategy
+#  Initialize transition probability array
+a_P_tunnels_tx <- array(0,  # Create 3-D array
+                        dim = c(n_states_tunnels_tx, n_states_tunnels_tx, n_cycles),
+                        dimnames = list(v_names_states_tunnels_tx, #row names: from-states
+                                        v_names_states_tunnels_tx, #column names: to-states
+                                        v_names_cycles[-length(v_names_cycles)])) #slice names: cycles
+# A stack of 27 x 27 transition matrices, one per cycle (420).
+# Slices differ in each cycle, because death probabilities rise with age. 
+
+#Fill in array below
+# Each line now uses ROW i of a 13 x 420 matrix (e.g. m_p_G_dead[i, ]), a vector of 420 values, instead of one number
+# (v_p_G_dead[i]). The blank third index puts value t into cycle t.
+
+#from Graft can go to next graft month, GL, or death
+
+#Part 1: graft tunnels G_1Mo to G_12Mo (move to the next month, lose the graft, or die)
+for(i in 1:(n_tunnel_size - 1)){
+  a_P_tunnels_tx[v_Graft_tunnel[i], v_Graft_tunnel[i + 1], ] <- 1 - m_p_G_dead[i, ] - m_p_G_GL[i, ] #Next graft month
+  a_P_tunnels_tx[v_Graft_tunnel[i], "GL_1Mo", ]              <-     m_p_G_GL[i, ]                   #GL
+  a_P_tunnels_tx[v_Graft_tunnel[i], "Dead", ]                <-     m_p_G_dead[i, ]                 #Death
+}
+
+# The above loop fills in transitions out of the first 12 graft tunnels for all 420 months at once. I is a tunnel position from 1 to 12. So, `n_tunnel_size - 1 = 12
+
+
+#Part 2: graft holding state G_13Mo+ (stay, lose the graft, or die)
+a_P_tunnels_tx[v_Graft_tunnel[n_tunnel_size], v_Graft_tunnel[n_tunnel_size], ] <- 1 - m_p_G_dead[n_tunnel_size, ] - m_p_G_GL[n_tunnel_size, ]
+a_P_tunnels_tx[v_Graft_tunnel[n_tunnel_size], "GL_1Mo", ]                      <-     m_p_G_GL[n_tunnel_size, ]
+a_P_tunnels_tx[v_Graft_tunnel[n_tunnel_size], "Dead", ]                        <-     m_p_G_dead[n_tunnel_size, ]
+# Note: every graft loss goes to GL_1Mo, whatever month it happens in. From Graft loss can continue to next month of GL or die.
+
+#Part 3 loops i from 1-12: so it uses rows 1 to 12 of m_p_GL_dead (0.05644, never below dialysis). Recall these probability don't exceed dialysis until age 107
+#Part 4 uses row 13 of m_p_GL_dead (= dialysis at that age).
+
+#Part 3: graft-loss tunnels GL_1Mo to GL_12Mo (move to the next month or die)
+for(i in 1:(n_tunnel_size - 1)){
+  a_P_tunnels_tx[v_GL_tunnel[i], v_GL_tunnel[i + 1], ] <- 1 - m_p_GL_dead[i, ] # Move to next month (within first year of GL)
+  a_P_tunnels_tx[v_GL_tunnel[i], "Dead", ]             <-     m_p_GL_dead[i, ] #Death within first year
+}
+
+#Part 4: graft-loss holding state GL_13Mo+ (stay or die)
+a_P_tunnels_tx[v_GL_tunnel[n_tunnel_size], v_GL_tunnel[n_tunnel_size], ] <- 1 - m_p_GL_dead[n_tunnel_size, ] #Survive with GL beyond  1 year
+a_P_tunnels_tx[v_GL_tunnel[n_tunnel_size], "Dead", ]                     <-     m_p_GL_dead[n_tunnel_size, ] #Die with GL after 1 year
+
+# from Dead
+a_P_tunnels_tx["Dead", "Dead", ] <- 1
+
+# Below: check every row of every transition matrix sums to 1: no one is lost or double-counted. a_P_tunnels_tx has 3 dimensions: [from-state, to-state, cycle] = 27 x 27 x 420.
+
+# Row sums for every state (rows) and cycle (columns). # apply() runs function over chosen dimensions. c(1, 3) keeps dimension 1 (from-state) and dimension 3 (cycle) and sums across dimension 2 (to-states).
+#m_row_sums = 27 x 420 matrix: one row per state, one column per cycle. Each cell is total probability of leaving that state in that cycle should be exactly 1.
+m_row_sums <- apply(a_P_tunnels_tx, c(1, 3), sum)
+m_row_sums[, 1:3]                         # look at the first three cycles. All values should be 1.
+
+# Find any state whose row does NOT sum to 1 in cycle 1. abs(m_row_sums[, 1] - 1) is how far each row sum is from 1. > 1e-10 allows for tiny rounding errors in computer arithmetic (e.g. 0.9999999999999999), which are not real mistakes.
+# which() returns the names/positions of rows that fail.
+
+which(abs(m_row_sums[, 1] - 1) > 1e-10)   # rows in cycle 1 that don't sum to 1 (should be none) = named integer(0)
+range(m_row_sums)                         # smallest and largest row sum anywhere (should be 1 1)
+
+# Check if transition array and probabilities are valid
+
+# Check that transition probabilities are in [0, 1]
+check_transition_probability(a_P_dial,       verbose = TRUE, err_stop = TRUE)
+check_transition_probability(a_P_tunnels_tx, verbose = TRUE, err_stop = TRUE)
+
+# Check that all rows sum to 1
+check_sum_of_transition_array(a_P_dial,       n_states = n_states_dial,       n_cycles = n_cycles, verbose = TRUE, err_stop = TRUE)
+check_sum_of_transition_array(a_P_tunnels_tx, n_states = n_states_tunnels_tx, n_cycles = n_cycles, verbose = TRUE, err_stop = TRUE)
+
+# Check that no state dies more slowly than the general population
+#m_p_pop_rows repeats the population probabilities as 13 rows so they can be compared with the 13 x 420 matrices. All should print TRUE.
+m_p_pop_rows <- matrix(v_p_pop_m, nrow = n_tunnel_size, ncol = n_cycles, byrow = TRUE)
+c(Dialysis      = all(v_p_dial_dead >= v_p_pop_m),
+  Graft         = all(m_p_G_dead    >= m_p_pop_rows),
+  Graft_loss    = all(m_p_GL_dead   >= m_p_pop_rows))
+```
+
+## 04.4 Create transition dynamics arrays
+
+```{r}
+# These arrays will capture transitions from each state to another over time.
+
+# a_P_dial (code above) is a transition probability array that carries the probability of moving from one state to another. This is run in section 4 above before the model runs and is used to move cohort forward
+
+# Codes below is The share of the whole cohort that actually made that move in that cycle. It has n_cycles +1 = 421 because extra slice of time for time zero to time 420 (vs cycle 0 to cycle 419). It is filled during the model run in section 5 and is used to add up costs and QALYS in section 8.
+
+#So a_A is proprotion of cohort and a_P is probabities
+
+# Initialize transition dynamics array for continued dialysis.
+a_A_dial <- array(0,
+                  dim = c(n_states_dial, n_states_dial, n_cycles + 1),
+                  dimnames = list(v_names_states_dial, v_names_states_dial, 0:n_cycles))
+
+# Set first slice of A with the initial state vector in its diagonal
+diag(a_A_dial[, , 1]) <- v_m_init_dial # This was created in section 4.1
+
+### Initialize transition dynamics array for the transplant strategy
+a_A_tunnels_tx <- array(0,
+                        dim = c(n_states_tunnels_tx, n_states_tunnels_tx, n_cycles + 1),
+                        dimnames = list(v_names_states_tunnels_tx, v_names_states_tunnels_tx, 0:n_cycles))
+
+diag(a_A_tunnels_tx[, , 1]) <- v_m_init_tunnels_tx #This was created in section 4.2
+```
+
+# **05 Run Markov model**
+
+```{r}
+# Iterative solution of state-residence dependent cSTM
+# Below loop runs the model starting distribution (row 1) and moves cohort x 420 months.  Each pass updates m_M where everyone is at next time point and updates a_A who moved from and to where
+# (Unchanged by ageing: the loop already used slice t of each array, a_P[, , t],
+#  so it automatically picks up the probabilities for the age in month t.)
+
+for (t in 1:n_cycles){ # This repeats code inside for t = 1,2,.420. Starts at row 1 (which is time 0)
+  ## Fill in cohort trace
+  # For continued dialysis
+  m_M_dial      [t + 1, ] <- m_M_dial      [t, ] %*% a_P_dial      [, , t] # m_M_dial[t, ] is current row (share of cohort in each state now) and a_P_dial[, , t] is the 2 × 2 probability matrix for this month. %*% is matrix multiplication.
+  # For ECD/DCD transplant
+  m_M_tunnels_tx[t + 1, ] <- m_M_tunnels_tx[t, ] %*% a_P_tunnels_tx[, , t]
+
+  ## Fill in transition-dynamics array
+  # For continued dialysis
+  a_A_dial      [, , t + 1] <- diag(m_M_dial      [t, ]) %*% a_P_dial      [, , t]
+  # For ECD/DCD transplant
+  a_A_tunnels_tx[, , t + 1] <- diag(m_M_tunnels_tx[t, ]) %*% a_P_tunnels_tx[, , t]
+}
+
+# Create aggregated trace
+# The transplant trace has 27 columns. This collapses it to 3 columns
+# (Graft, GraftLoss, Dead) by adding the tunnels of each group.
+
+#m_M_tunnels_tx[, v_Graft_tunnel] takes the 13 graft columns. rowSums(...) adds them together in each month. The same is done for the 13 graft-loss columns. Dead is already one column, so it's copied. cbind(...) puts the three columns side by side: 421 rows × 3 column
+
+# Detailed trace (27 columns)	→   	Summary (3 column)
+# G_1Mo + G_2Mo + … + G_13Mo+	→	     Graft
+#GL_1Mo + GL_2Mo + … + GL_13Mo+	→	  GraftLoss
+#Dead	→	                             Dead
+
+m_M_tunnels_tx_sum <- cbind(Graft     = rowSums(m_M_tunnels_tx[, v_Graft_tunnel]),
+                            GraftLoss = rowSums(m_M_tunnels_tx[, v_GL_tunnel]),
+                            Dead      = m_M_tunnels_tx[, "Dead"])
+# (Selecting columns by name instead of by position, e.g. 2:(n_tunnel_size + 1) in the template, avoids errors because the graft and graft-loss tunnels sit next to each other.)
+
+## Store the cohort traces in a list. A list is a container that can hold objects of different sizes and shapes. That matters here because the two strategies don't match: dialysis m_M_dial 421 x 2 whereas transplant is 421 x 3, and dynamics array is 2 x 2 x 421 vs 27 x 27 x 421
+l_m_M <- list(m_M_dial, # item 1: dialysis trace (dialysis, dead)
+              m_M_tunnels_tx_sum) # item 2 summarized transplant trace (G, GL, dead)
+names(l_m_M) <- v_names_str
+
+## Store the transition dynamics array for each strategy in a list
+l_a_A <- list(a_A_dial,
+              a_A_tunnels_tx)
+names(l_a_A) <- v_names_str
+
+# Key: in section 08, the costs and QALYs are calculated in a loop over strategies. With the lists, the same block of code runs once for dialysis (i = 1) and once for transplant (i = 2). That's why the order of every list (l_u, l_c, l_a_A, v_names_str) has to match: item 1 is always dialysis, item 2 always transplant.
+
+# l_a_A holds the full 27-state transplant array, because the cost and QALY calculation needs every state's own cost and utility.
+#l_m_M holds the 3-column summary of the transplant trace. It's a convenient store for plotting and checking. In our code, section 08 doesn't use it, because the rewards come from l_a_A.
+
+# Check that the main model reproduces the calibration target. Row 61 = month 60 (5 years). Should print 0.59, the same as calc_surv_tx() in Step 6. If not, the calibration function and the main model are using different probabilities.
+1 - m_M_tunnels_tx_sum[61, "Dead"]
+```
+
+# **06 Plot Outputs**
+
+## 06.1 Plot the cohort trace for each strategy
+
+```{r}
+
+# Colours for each health state (matched to the trace's column names). This was done intentionally so that colours match severity of State 
+v_col_states <- c(Graft     = "#1F7A8C",   # blue/teal
+                  GraftLoss = "#E08E0B",   # amber/orange
+                  Dead      = "#333333",   # dark charcoal
+                  Dialysis  = "#6C5B7B")   # muted purple (dialysis arm only)
+
+## Plot the cohort trace for the transplant strategy (aggregated)
+plot_trace(m_M_tunnels_tx_sum) +
+  scale_color_manual(values = v_col_states, name = "Health state") +
+  scale_linetype_discrete(name = "Health state") +   # same legend title, so colour and line type share one legend
+  ggtitle("ECD/DCD transplant")
+
+## Plot the cohort trace for continued dialysis
+plot_trace(m_M_dial) +
+  scale_color_manual(values = v_col_states, name = "Health state") +
+  scale_linetype_discrete(name = "Health state") +
+  ggtitle("Continued dialysis")
+# Note: the x-axis is in cycles (months).
+
+```
+
+## 06.2 Overall Survival (OS)
+
+```{r}
+v_os_dial <- 1 - m_M_dial[, "Dead"]              # OS probability, continued dialysis. m_M_dial[, "Dead"] takes the "Dead" column of the dialysis trace, all 421 rows. 1- subtracts it from 1 and gives share alive for every row
+
+v_os_tx   <- 1 - m_M_tunnels_tx_sum[, "Dead"]    # OS probability, transplant. Same idea as above (subtract dead from 1)
+
+v_os_tx   <- rowSums(m_M_tunnels_tx_sum[, 1:2])  # alternative way of calculating the OS probability. Here takes columns 1 and 2 (G, GL) and sum it up. should get same val
+
+# General-population survival from age 75, for comparison.
+# Survival multiplies month by month: S(t) = (1 - p(1)) x (1 - p(2)) x ... x (1 - p(t)).
+# cumprod() runs product; c(1, ...) adds month 0 (everyone alive).
+v_os_pop <- c(1, cumprod(1 - v_p_pop_m))         # 421 values, months 0-420
+
+# create a simple plot showing the OS (x-axis in years)
+v_years <- (0:n_cycles) * cycle_length # since cycle length = 1/12, it divides by 12. So 420/12 = 35 years
+plot(v_years, v_os_tx, type = 'l',
+     ylim = c(0, 1),
+     ylab = "Survival probability",
+     xlab = "Years since kidney offer (age 75 at time zero)",
+     main = "Overall Survival")
+lines(v_years, v_os_dial, lty = 2)
+lines(v_years, v_os_pop,  lty = 3, col = "grey40")              
+legend("topright", legend = c(v_names_str[c(2, 1)], "General population, age 75"),
+       lty = c(1, 2, 3), col = c("black", "black", "grey40"), bty = "n")   
+# add grid
+grid(nx = 35, ny = 10, col = "lightgray", lty = "dotted", lwd = par("lwd"), equilogs = TRUE)
+
+# Survival at selected years: check against the targets
+# 5 years: dialysis 0.55 and transplant 0.59 [1]
+# 15 and 20 years and the general population added
+v_check_years <- c(1, 2, 3, 5, 10, 15, 20)
+data.frame(Year       = v_check_years,
+           Dialysis   = round(v_os_dial[v_check_years * 12 + 1], 3),
+           Transplant = round(v_os_tx  [v_check_years * 12 + 1], 3),
+           Population = round(v_os_pop [v_check_years * 12 + 1], 3))
+# Expected:  year 1  0.893 0.860 0.976
+#            year 5  0.550 0.590 0.859
+#            year 10 0.271 0.333 0.662
+#            year 20 0.030 0.047 0.177
+
+
+# (1) Share still alive at age 110 (end of horizon): should be about 0
+c(Dialysis = v_os_dial[n_cycles + 1], Transplant = v_os_tx[n_cycles + 1])
+# (2) Median survival: first month when fewer than half are alive, in years
+c(Dialysis   = which(v_os_dial < 0.5)[1] - 1,
+  Transplant = which(v_os_tx   < 0.5)[1] - 1) * cycle_length   # about 5.75 and 6.58 years
+# (-1 because element 1 of the vector is month 0)
+# Sone registries report median survival ~ 6-6.5 years after transplant in KTR aged 70-79.
+# Survival, QALYs and costs over time are plotted together in section 08.1, after costs and QALYs have been calculated
+```
+
+```{r}
+
+# This section was meant to examine survival. Transplant survival starts BELOW dialysis (early post-operative deaths) and later rises ABOVE it. Find the first month where transplant survival catches up with dialysis.
+
+v_diff_os <- v_os_tx - v_os_dial # If negative, transplant worse
+
+# First month (after month 0) where the difference turns from negative to >= 0
+t_cross <- which(v_diff_os[-1] >= 0 & v_diff_os[-length(v_diff_os)] < 0)[1]
+# v_diff_os[-1] = months 1-420; v_diff_os[-length(...)] = months 0-419 (the month before).
+# which(...)[1] keeps the first crossing. t_cross is then the month number.
+
+# Survival at the crossing month
+c(Month      = t_cross,
+  Years      = t_cross * cycle_length,
+  Dialysis   = round(v_os_dial[t_cross + 1], 3),   # + 1 because element 1 is month 0
+  Transplant = round(v_os_tx  [t_cross + 1], 3))
+# Expected (with ageing): month 31 (2.6 years), unchanged from the version without ageing.
+# Leeaphorn et al. [2] reported equal survival at about 3 years.
+
+# Add the crossing point to the survival plot from 06.2
+plot(v_years, v_os_tx, type = 'l', ylim = c(0, 1),
+     ylab = "Survival probability", xlab = "Years since kidney offer",
+     main = "Overall Survival")
+lines(v_years, v_os_dial, lty = 2)
+abline(v = t_cross * cycle_length, col = "grey40", lty = 3)
+legend("topright", legend = v_names_str[c(2, 1)], lty = c(1, 2), bty = "n")
+text(t_cross * cycle_length, 0.95,
+     paste0("Equal survival at ", round(t_cross * cycle_length, 1), " years"),
+     pos = 4, cex = 0.8)
+
+```
+
+## 06.2.1 Life Expectancy (LE)
+
+```{r}
+
+# v_os calculated above and highlights the proportion alive at each month (for dialysis, in dialysis arm and for transplant, in G and GL)
+# sum adds the monthly survival and cycle length converts to years
+
+v_le_dial <- sum(v_os_dial) * cycle_length # summing probability of OS over time (i.e. life expectancy, years)
+v_le_tx   <- sum(v_os_tx)   * cycle_length
+v_le_pop  <- sum(v_os_pop)  * cycle_length # general population aged 75, for comparison
+c(Dialysis = v_le_dial, Transplant = v_le_tx, Population = v_le_pop)
+
+# Key: This is undiscounted, does not include quality of life adjustment, and no WCC yet
+
+
+```
+
+## 06.3 Prevalence of graft survival
+
+```{r}
+# Proportion of transplant recipients who have a functioning graft, at each time point
+
+# Among survivors only
+v_prev_alive <- m_M_tunnels_tx_sum[, "Graft"] / v_os_tx # divide those still in "graft" states by those who are alive
+
+# Among everyone who started (so this is all cause graft survival)
+v_prev_all <- m_M_tunnels_tx_sum[, "Graft"] # the Graft column already is a share of the starting cohort, so no division is needed.
+
+plot(v_years, v_prev_alive,
+     ylim = c(0, 1),
+     ylab = "Proportion with a functioning graft",
+     xlab = "Years since transplant",
+     main = "Functioning graft",
+     type = "l")
+lines(v_years, v_prev_all, lty = 2)                       # second line, dashed
+legend("topright",
+       legend = c("Among survivors", "Among all transplanted"),
+       lty    = c(1, 2), bty = "n")
+# Expected (with ageing): among survivors 0.948 / 0.886 / 0.815 and among all
+# transplanted 0.815 / 0.523 / 0.271 at 1 / 5 / 10 years.
+# Note: the "among survivors" line is NOT death-censored graft survival (see notes).
+```
+
+# **07 State Rewards**
+
+```{r}
+# (Unchanged by ageing: costs and utilities do not depend on age.)
+# Scale by the cycle length
+# Utilities are annual, so they are multiplied by cycle_length (1/12) to give QALYs per month.
+#Costs are already per month, so they are not multiplied by cycle_length
+
+## Continued dialysis v_u_dial =  0.05916667 0.00000000 and v_c_dial = 8928.966    0.000
+v_u_dial <- c(Dialysis = u_dial,
+              Dead     = u_D) * cycle_length
+
+v_c_dial <- c(Dialysis = c_dial,
+              Dead     = c_D)
+
+# ECD/DCD transplant
+
+# Vector of utilities per cycle for the graft tunnels: months 1-3 = u_G1to3; months 4-12 and the holding state = u_graft.
+#rep(u_G1to3, 3) repeats 0.71 three times, for G_1Mo, G_2Mo and G_3M. For the later months, we do n_tunnel_size - 3 = 13 − 3 = 10 because the first 3 states already have a value, so 10 graft states are left. Thus, rep(u_graft, 10) repeats 0.82 ten times, for G_4Mo to G_12Mo (9 states) plus G_13Mo+ (1 state).
+v_u_G_tx         <- c(rep(u_G1to3, 3), rep(u_graft, n_tunnel_size - 3))
+names(v_u_G_tx)  <- v_Graft_tunnel
+
+# Vector of utilities for the graft-loss tunnels (same in every month, equivalent to dialysis utility)
+v_u_GL_tx        <- rep(u_GL, n_tunnel_size)
+names(v_u_GL_tx) <- v_GL_tunnel
+
+# Vector of utilities under the transplant strategy (27 values)
+v_u_tx <- c(v_u_G_tx,
+            v_u_GL_tx,
+            Dead = u_D) * cycle_length
+
+# Vector of costs per cycle for the graft tunnel. Recall, we have defined separate costs for days 0-90, 91-360, and later years (after months 13), graft loss (assumed to be dialysis), and death (0)
+# months 1-3, months 4-12, and month 13+ differ (follow-up periods in [5])
+v_c_G_tx         <- c(rep(c_G1to3, 3), rep(c_G4to12, 9), c_G13p)
+names(v_c_G_tx)  <- v_Graft_tunnel
+
+# Vector of costs for the graft-loss tunnels (dialysis cost). 13 states with GL cost
+v_c_GL_tx        <- rep(c_GL, n_tunnel_size)
+names(v_c_GL_tx) <- v_GL_tunnel
+
+# Vector of costs under the transplant strategy (27 values) using v_c_G_tx (0-3 months, 3-12 months, month 13+), v_c_GL_tx (one cost for 13 states), and death
+v_c_tx <- c(v_c_G_tx,
+            v_c_GL_tx,
+            Dead = c_D)
+
+## Store state rewards
+# Store the vectors of state utilities for each strategy in a list
+l_u   <- list(dial = v_u_dial,
+              tx   = v_u_tx)
+# Store the vectors of state cost for each strategy in a list
+l_c   <- list(dial = v_c_dial,
+              tx   = v_c_tx)
+
+#One-time costs at time zero (transplant only)
+v_c_once <- c(dial = 0,
+              tx   = c_tx_once)
+
+# assign strategy names
+names(l_u) <- names(l_c) <- names(v_c_once) <- v_names_str
+```
+
+# **08 Compute expected outcomes**
+
+```{r}
+# Create empty vectors to store total utilities and costs
+v_tot_qaly <- v_tot_cost <- vector(mode = "numeric", length = n_str)
+
+names(v_tot_qaly) <- names(v_tot_cost) <- v_names_str
+# so this creates vector 0,0 with names dialysis, transplantation
+
+# >>> NEW (plots over time): empty lists to keep each strategy's discounted
+# QALYs and costs in every cycle, used for the plots in section 08.1
+l_qaly_cycle <- l_cost_cycle <- vector(mode = "list", length = n_str)
+names(l_qaly_cycle) <- names(l_cost_cycle) <- v_names_str
+
+## Loop through each strategy and calculate total utilities and costs
+for (i in 1:n_str) { # i <- 1. i = 1 is continued dialysis, i = 2 is ECD
+  v_u_str   <- l_u[[i]]   # select the vector of state utilities for the i-th strategy. Recall l_u is list as above
+  v_c_str   <- l_c[[i]]   # select the vector of state costs for the i-th strategy.
+  a_A_str   <- l_a_A[[i]] # select the transition array for the i-th strategy
+  # (not in template) the two strategies have different numbers of states
+  n_states_str     <- dim(a_A_str)[1] # 2 for dialysis, 27 transplant
+  v_names_str_states <- dimnames(a_A_str)[[1]]
+
+  #Key i here is strategy: dialysis vs transplantation
+  # v_u_str. i = 1	2 values (Dialysis 0.0592, Dead 0). i =2	27 values (utility ÷ 12 per state)
+  #v_c_str	 i=  1 2 values ($8,928.97, $0)	            i=2   27 values
+  # a_A_str	       2 × 2 × 421	                        27 × 27 × 421
+
+  ## Array of state rewards
+  # Create transition matrices of state utilities and state costs for the i-th strategy
+  m_u_str   <- matrix(v_u_str, nrow = n_states_str, ncol = n_states_str, byrow = T)
+  m_c_str   <- matrix(v_c_str, nrow = n_states_str, ncol = n_states_str, byrow = T)
+  # Expand the transition matrix of state utilities across cycles to form a transition array of state utilities
+  a_R_u_str <- array(m_u_str,
+                     dim      = c(n_states_str, n_states_str, n_cycles + 1),
+                     dimnames = list(v_names_str_states, v_names_str_states, 0:n_cycles))
+  # Expand the transition matrix of state costs across cycles to form a transition array of state costs
+  a_R_c_str <- array(m_c_str,
+                     dim      = c(n_states_str, n_states_str, n_cycles + 1),
+                     dimnames = list(v_names_str_states, v_names_str_states, 0:n_cycles))
+
+  #Expected QALYs and costs for all transitions per cycle
+  # QALYs = life years x QoL
+  # Note: utilities were scaled to per month in section 07; costs are per month.
+  a_Y_c_str <- a_A_str * a_R_c_str
+  a_Y_u_str <- a_A_str * a_R_u_str
+
+  # Expected QALYs and costs per cycle
+  ## Vector of QALYs and costs
+  v_qaly_str <- apply(a_Y_u_str, 3, sum) # sum the proportion of the cohort across transitions
+  v_cost_str <- apply(a_Y_c_str, 3, sum) # sum the proportion of the cohort across transitions
+
+  #Discounted total expected QALYs and Costs per strategy and apply within-cycle correction if applicable
+  # QALYs
+  v_tot_qaly[i] <- t(v_qaly_str) %*% (v_dwe * v_wcc) #MM. t transposes and turns QALY column into row so it fits multiplication (1 x 421 times 421 x 1). %*% multiplies then adds all 421 products
+  # Costs (plus the one-time transplant cost at time zero, not discounted
+  # and not subject to the within-cycle correction)
+  v_tot_cost[i] <- t(v_cost_str) %*% (v_dwc * v_wcc) + v_c_once[i]
+
+  # >>> NEW (plots over time): discounted QALYs and costs in each cycle,
+  # with the same discount and within-cycle weights as the totals above,
+  # so adding them up over all 421 time points gives v_tot_qaly and v_tot_cost
+  l_qaly_cycle[[i]] <- v_qaly_str * v_dwe * v_wcc
+  l_cost_cycle[[i]] <- v_cost_str * v_dwc * v_wcc
+}
+
+v_tot_cost   # expected: about 694,883 (dialysis) and 434,219 (transplant)  
+v_tot_qaly   # expected: about 4.605 (dialysis) and 5.704 (transplant)       
+```
+
+## 08.1 Survival, QALYs and costs over time
+
+This section gives more context of the above visualizations after applying state rewards. We display three panels with the same x-axis (years since the kidney offer) survival, cumulative discounted QALYs and cumulative discounted costs.
+
+```{r, fig.height = 9, fig.width = 7}
+
+# Cumulative = running total from time 0 to each month. cumsum() adds the
+# per-cycle values one by one: month 0, month 0 + month 1, and so on.
+# The last value of each running total equals the totals from section 08.
+v_cum_qaly_dial <- cumsum(l_qaly_cycle[["Continued dialysis"]])
+v_cum_qaly_tx   <- cumsum(l_qaly_cycle[["ECD/DCD transplant"]])
+# Costs: the one-time transplant cost is added at time 0, so the transplant
+# line starts at $61,042 instead of $0
+v_cum_cost_dial <- cumsum(l_cost_cycle[["Continued dialysis"]]) + v_c_once["Continued dialysis"]
+v_cum_cost_tx   <- cumsum(l_cost_cycle[["ECD/DCD transplant"]]) + v_c_once["ECD/DCD transplant"]
+
+# Check: the end of each running total matches section 08 (should print TRUE TRUE)
+c(QALYs = isTRUE(all.equal(c(tail(v_cum_qaly_dial, 1), tail(v_cum_qaly_tx, 1)), unname(v_tot_qaly))),
+  Costs = isTRUE(all.equal(unname(c(tail(v_cum_cost_dial, 1), tail(v_cum_cost_tx, 1))), unname(v_tot_cost))))
+
+# Three panels stacked vertically, sharing the x-axis (v_years from section 06.2)
+op <- par(mfrow = c(3, 1),            # 3 rows, 1 column
+          mar   = c(2, 4.5, 2, 1),    # margins of each panel: bottom, left, top, right
+          oma   = c(3, 0, 0, 0))      # outer margin at the bottom for the shared x-axis label
+
+# Panel 1: survival (same as section 06.2)
+plot(v_years, v_os_tx, type = "l", ylim = c(0, 1),
+     ylab = "Survival probability", xlab = "", main = "Survival")
+lines(v_years, v_os_dial, lty = 2)
+lines(v_years, v_os_pop,  lty = 3, col = "grey40")
+legend("topright", legend = c(v_names_str[c(2, 1)], "General population, age 75"),
+       lty = c(1, 2, 3), col = c("black", "black", "grey40"), bty = "n")
+
+# Panel 2: cumulative discounted QALYs
+plot(v_years, v_cum_qaly_tx, type = "l",
+     ylim = c(0, max(v_cum_qaly_tx, v_cum_qaly_dial)),
+     ylab = "Cumulative QALYs (discounted)", xlab = "", main = "QALYs")
+lines(v_years, v_cum_qaly_dial, lty = 2)
+legend("bottomright", legend = v_names_str[c(2, 1)], lty = c(1, 2), bty = "n")
+
+# Panel 3: cumulative discounted costs, in thousands of dollars
+plot(v_years, v_cum_cost_tx / 1000, type = "l",
+     ylim = c(0, max(v_cum_cost_tx, v_cum_cost_dial) / 1000),
+     ylab = "Cumulative cost ($ thousands, discounted)", xlab = "", main = "Costs")
+lines(v_years, v_cum_cost_dial / 1000, lty = 2)
+legend("bottomright", legend = v_names_str[c(2, 1)], lty = c(1, 2), bty = "n")
+
+mtext("Years since kidney offer (age 75 at time zero)", side = 1, outer = TRUE, line = 1)
+par(op)   # restore the usual one-plot layout
+
+# Reading the panels:
+# - QALYs: the transplant line is just below dialysis for the first 3 months
+#   (early deaths, dialysis-level utility in months 1-3), then rises above it.
+#   Expected: 0.68 vs 0.73 at 1 year; 2.60 vs 2.95 at 5 years; 3.86 vs 4.58 at 10 years (dialysis vs transplant).
+# - Costs: transplant starts higher (one-time cost, high costs in months
+#   1-3), but dialysis costs about $8,900 per month, so the dialysis line
+#   overtakes it at month 20 (about 1.7 years) and keeps pulling away.
+#   Expected: $102,805 vs $134,095 at 1 year; $392,479 vs $256,210 at 5 years.
+# - All lines flatten in the 90s as almost everyone has died.
+# Small zig-zags come from the Simpson's 1/3 weights (1/3, 2/3, 4/3, ...).
+```
+
+```{r}
+
+# >>> NEW: crossover points between the two strategies --------------------------
+# Helper function: first month where the difference a - b turns from
+# negative (a below b) to zero or positive (a has caught up with b).
+# a[-1] = months 1-420; a[-length(a)] = the month before (0-419).
+# Returns the month number (0 = time zero), or NA if the lines never cross.
+find_cross <- function(a, b) {
+  v_diff <- a - b
+  which(v_diff[-1] >= 0 & v_diff[-length(v_diff)] < 0)[1]
+}
+
+# 1. Survival: transplant catches up with dialysis (same as the earlier t_cross)
+t_cross_os   <- find_cross(v_os_tx, v_os_dial)
+# 2. QALYs: cumulative transplant QALYs catch up with dialysis
+t_cross_qaly <- find_cross(v_cum_qaly_tx, v_cum_qaly_dial)
+# 3. Costs: cumulative DIALYSIS costs catch up with transplant (transplant starts
+#    higher because of the one-time cost), so the order of the arguments is reversed
+t_cross_cost <- find_cross(v_cum_cost_dial, v_cum_cost_tx)
+
+# Crossover points in months and years
+data.frame(Outcome = c("Survival", "Cumulative QALYs", "Cumulative costs"),
+           Month   = c(t_cross_os, t_cross_qaly, t_cross_cost),
+           Years   = round(c(t_cross_os, t_cross_qaly, t_cross_cost) * cycle_length, 2))
+# Expected: survival month 31 (2.58 years); QALYs month 4 (0.33 years);
+#           costs month 20 (1.67 years)
+
+# Small helper to draw the vertical line and its label on the current panel.
+# y_pos is where the label goes, as a share of the panel's height (0 = bottom, 1 = top).
+add_cross_line <- function(t_month, y_top, label, y_pos = 0.9) {
+  if (is.na(t_month)) return(invisible(NULL))                 # no line if they never cross
+  x <- t_month * cycle_length                                  # month -> years
+  abline(v = x, col = "grey40", lty = 3)
+  text(x, y_pos * y_top, paste0(label, " at ", round(x, 1), " years"), pos = 4, cex = 0.8)
+}
+
+# Redraw the three panels with the crossover lines
+op <- par(mfrow = c(3, 1), mar = c(2, 4.5, 2, 1), oma = c(3, 0, 0, 0))
+
+# Panel 1: survival
+plot(v_years, v_os_tx, type = "l", ylim = c(0, 1),
+     ylab = "Survival probability", xlab = "", main = "Survival")
+lines(v_years, v_os_dial, lty = 2)
+lines(v_years, v_os_pop,  lty = 3, col = "grey40")
+add_cross_line(t_cross_os, y_top = 1, label = "Equal survival", y_pos = 0.15)
+legend("topright", legend = c(v_names_str[c(2, 1)], "General population, age 75"),
+       lty = c(1, 2, 3), col = c("black", "black", "grey40"), bty = "n")
+
+# Panel 2: cumulative QALYs
+y_max_q <- max(v_cum_qaly_tx, v_cum_qaly_dial)
+plot(v_years, v_cum_qaly_tx, type = "l", ylim = c(0, y_max_q),
+     ylab = "Cumulative QALYs (discounted)", xlab = "", main = "QALYs")
+lines(v_years, v_cum_qaly_dial, lty = 2)
+add_cross_line(t_cross_qaly, y_top = y_max_q, label = "Equal QALYs", y_pos = 0.9)
+legend("bottomright", legend = v_names_str[c(2, 1)], lty = c(1, 2), bty = "n")
+
+# Panel 3: cumulative costs ($ thousands)
+y_max_c <- max(v_cum_cost_tx, v_cum_cost_dial) / 1000
+plot(v_years, v_cum_cost_tx / 1000, type = "l", ylim = c(0, y_max_c),
+     ylab = "Cumulative cost ($ thousands, discounted)", xlab = "", main = "Costs")
+lines(v_years, v_cum_cost_dial / 1000, lty = 2)
+add_cross_line(t_cross_cost, y_top = y_max_c, label = "Equal costs", y_pos = 0.9)
+legend("bottomright", legend = v_names_str[c(2, 1)], lty = c(1, 2), bty = "n")
+
+mtext("Years since kidney offer (age 75 at time zero)", side = 1, outer = TRUE, line = 1)
+par(op)
+
+```
+
+# **09 Cost-effectiveness Ratio (CER)**
+
+```{r}
+## Incremental cost-effectiveness ratios (ICERs)
+# using the dampack package
+df_cea <- calculate_icers(cost       = v_tot_cost,
+                          effect     = v_tot_qaly,
+                          strategies = v_names_str)
+df_cea
+# Transplant costs less and gives more QALYs, so continued dialysis is dominated ("D") and no ICER is calculated.
+```
+
+```{r}
+## CEA table in proper format
+# using the dampack package
+table_cea <- format_table_cea(df_cea)
+table_cea
+```
+
+```{r}
+## (not in template) Incremental results vs continued dialysis
+wtp <- 50000   # willingness-to-pay threshold, $ per QALY
+df_incr <- data.frame(Strategy    = v_names_str,
+                      Cost        = round(v_tot_cost),
+                      QALYs       = round(v_tot_qaly, 3),
+                      Inc_Cost    = round(v_tot_cost - v_tot_cost[1]),
+                      Inc_QALYs   = round(v_tot_qaly - v_tot_qaly[1], 3),
+                      Inc_NMB     = round(wtp * (v_tot_qaly - v_tot_qaly[1]) - (v_tot_cost - v_tot_cost[1])))
+df_incr
+# expected incremental cost about -260,664; incremental QALYs about +1.099;
+# incremental net monetary benefit at $50,000/QALY about 315,625
+
+```
+
+```{r}
+## CEA frontier
+# using the dampack package
+plot_icers(df_cea, label = "all", txtsize = 16) +
+  expand_limits(x = max(table_cea$QALYs) + 0.1) +
+  theme(legend.position = c(0.8, 0.3))
+```
+
+# **10 Deterministic Sensitivity Analysis (DSA)**
+
+```{r}
+## Load model, CEA and PSA functions 
+source('Functions_SA_Tunnels.R')
+results_dir <- file.path('results', 'tunnels_ageing')   # >>> CHANGED (ageing): new folder, so the no-ageing results are kept
+dir.create(results_dir, recursive=TRUE, showWarnings=FALSE)
+```
+
+## 10.1 Model input for SA
+
+```{r}
+# A function was added to Functions_SA_Tunnels.R to be called in this analysis. 
+l_params_all <- get_base_params()
+
+#l_params_all
+```
+
+**Helper Functions in Functions_SA_Tunnels.R**
+
+>>> main functions in `Functions_SA_Tunnels.R` are:
+
+- `get_base_params()`: base-case inputs. The constant death rates
+  `r_dial_dead` and `r_G_dead` are replaced by the extra death rates
+  `r_dial_exc` and `r_G_exc` (added to the population rate at each age),
+  and the life table (`v_q_pop`, ages 75–109) and `age_start` are added.
+- `run_model_traces()`: builds the age-dependent probabilities, the
+  3-D transition arrays and the cohort traces for both strategies (same
+  steps as sections 03.1, 04.3 and 05).
+- `calculate_ce_out()`: calls `run_model_traces()` and computes total
+  costs, QALYs and net monetary benefit (NMB) for each strategy, with
+  Simpson's 1/3 correction and the same discounting as section 08.
+- `calibrate_base_params()`: recalculates `r_dial_exc` and `r_G_exc`
+  from the life table and the 5-year targets (55% and 59%).
+- `generate_psa_params()`, `get_sa_spec()`, `get_owsa_ranges()`:
+  unchanged.
+
+```{r}
+# 1. Life table: values stored in get_base_params() is same for values read from the CSV (section 03.1, Step 0)
+stopifnot(isTRUE(all.equal(l_params_all$v_q_pop, v_q_pop)))
+
+# 2. Calibration: same extra death rates as section 03.1 (Steps 1 and 6)
+v_calib <- calibrate_base_params()
+v_calib                                  # r_dial_exc about 0.0892, r_G_exc about 0.0419
+stopifnot(isTRUE(all.equal(unname(v_calib["r_dial_exc"]), r_dial_exc,           tolerance = 1e-6)),
+          isTRUE(all.equal(unname(v_calib["r_G_exc"]),    r_G_exc,              tolerance = 1e-6)),
+          isTRUE(all.equal(l_params_all$r_G_exc,          r_G_exc,              tolerance = 1e-6)))
+```
+
+```{r, warning = FALSE, results='hide'}
+# Try the calculate_ce_out() function
+df_ce <- calculate_ce_out(l_params_all)
+df_ce
+# expected costs about 694,883 and 434,219; QALYs about 4.605 and 5.704
+
+# >>> NEW (ageing) 3. Base case: same totals as section 08 (v_tot_cost, v_tot_qaly)
+stopifnot(isTRUE(all.equal(df_ce$Cost,   as.numeric(v_tot_cost), tolerance = 1e-6)),
+          isTRUE(all.equal(df_ce$Effect, as.numeric(v_tot_qaly), tolerance = 1e-6)))
+
+# Get strategies names (will be used to label plots)
+v_names_str <- df_ce$Strategy
+n_str <- length(v_names_str)
+```
+
+## 10.2 One-way sensitivity analysis (OWSA)
+
+The OWSA ranges come from the literature (published 95% CIs, other cohorts of older recipients, other Canadian dialysis modalities, CADTH guidance). Same values are used for the PSA SEs (section 11) and used  10% of the mean otherwise(this came from the literature(Franklin & Hunter (2019) AND Brodtkorb et al. (2024))
+
+Two death rates are calibrated, so their ranges are found by re-calibrating to the ends of the published CI for 5-year survival
+
+```{r owsa-ranges-literature}
+## Literature-based ranges for the OWSA
+k_cpi_2019 <- 164.2 / 136.0          # CPI 2019 -> 2025 (Statistics Canada [7]; 2019 = 136.0)
+# Base-case dialysis cost without the facility HD component (2016 CAD per month), see section 03 "c_dial"
+c_dial_other_2016 <- c_dial / k_cpi - 50075.81 / 12
+# Relative width of the 95% CI of the 2-year deceased-donor transplant cost [6]:
+# $121,121 (95% CI 114,287 to 127,956)
+v_tx_ci_rel <- c(114287, 127956) / 121121          # 0.944 and 1.056
+
+df_owsa_lit <- data.frame(
+  pars = c("r_dial_exc", "r_G_exc", "hr_early", "r_GL_y1", "r_GL_y2p",
+           "p_GL_dead_annual", "u_dial", "u_graft",
+           "c_dial", "c_G1to3", "c_G4to12", "c_G13p", "c_tx_once",
+           "d_c", "d_e", "early_utility_fraction", "n_cycles"),
+  min  = c(r_dial_exc,                                                  # 55% alive at 5 y (base) [1]
+           calibrate_base_params(surv5_tx = 0.66)["r_G_exc"],           # 66% at 5 y (upper 95% CI) [1]
+           1.50,                                                        # lower 95% CI of HR 2.29 [2]
+           -log(0.955),                                                 # 95.5% 1-y DCGS, older DCD kidneys [14]
+           -log(0.860 / 0.902) / 4,                                     # 90.2% at 1 y, 86.0% at 5 y, donors and recipients >=65 [17]
+           0.474,                                                       # lower 95% CI [4]
+           0.82 - 0.15,                                                 # transplant 0.82 minus upper CI of decrement 0.15 [8]
+           0.74,                                                        # lower 95% CI, TTO referent [8]
+           k_cpi * (c_dial_other_2016 + 29969.07 / 12),                 # home PD (CAPD) instead of facility HD [5]
+           c_G1to3  * v_tx_ci_rel[1],                                   # [6]
+           c_G4to12 * v_tx_ci_rel[1],
+           c_G13p   * v_tx_ci_rel[1],
+           c_tx_once * v_tx_ci_rel[1],
+           0, 0,                                                        # CADTH: 0% [9]
+           0,                                                           # dialysis utility in months 1-3 (base)
+           60),                                                         # 5-year horizon
+  max  = c(calibrate_base_params(surv5_dial = 0.54)["r_dial_exc"],      # 54% at 5 y (lower 95% CI) [1]
+           calibrate_base_params(surv5_tx = 0.51)["r_G_exc"],           # 51% at 5 y (lower 95% CI) [1]
+           3.49,                                                        # upper 95% CI of HR 2.29 [2]
+           -log(0.902),                                                 # 90.2% 1-y DCGS, donors and recipients >=65 [17]
+           r_GL_y2p,                                                    # base (DCD [13]) is the highest published estimate
+           0.533,                                                       # upper 95% CI [4]
+           0.82 - 0.08,                                                 # transplant 0.82 minus lower CI of decrement 0.08 [8]
+           0.90,                                                        # upper 95% CI, TTO referent [8]
+           k_cpi_2019 * 67415.55 / 12 +                                 # in-centre HD, Manitoba 2019 [18],
+             k_cpi * (c_dial_other_2016 - (6614 + 5475) / 12),          #   replacing facility HD + physician + capital
+           c_G1to3  * v_tx_ci_rel[2],
+           c_G4to12 * v_tx_ci_rel[2],
+           c_G13p   * v_tx_ci_rel[2],
+           c_tx_once * v_tx_ci_rel[2],
+           0.03, 0.03,                                                  # CADTH: 3% [9]
+           1,                                                           # full graft utility from month 1 (assumption)
+           n_cycles),                                                   # lifetime (base)
+  source = c("Hellemans [1]: 5-y dialysis survival 55% (54-55%)",
+             "Hellemans [1]: 5-y ECD/DCD survival 59% (51-66%)",
+             "Leeaphorn [2]: HR 2.29 (1.50-3.49), days 0-90",
+             "GEODAS [14] 95.5%; de Boer [17] 90.2%",
+             "de Boer [17] 86.0% at 5 y; base Perez-Saez [13]",
+             "Vanhove [4]: 50.2% (47.4-53.3%)",
+             "Wyld [8]: dialysis 0.11 lower (0.08-0.15)",
+             "Wyld [8]: transplant 0.82 (0.74-0.90)",
+             "Ferguson [5] CAPD; Bamforth [18] in-centre HD",
+             "Barnieh [6]: 95% CI of 2-y cost", "Barnieh [6]", "Barnieh [6]", "Barnieh [6]",
+             "CADTH [9]", "CADTH [9]", "Assumption (scenario)", "Scenario: 5-y horizon"))
+df_owsa_lit$min <- as.numeric(df_owsa_lit$min)
+df_owsa_lit$max <- as.numeric(df_owsa_lit$max)
+df_owsa_lit$base <- unlist(l_params_all[df_owsa_lit$pars])
+
+# >>> NEW: the CI limits used for the PSA standard errors (get_ci_se() in the
+# functions file) must be the same as the OWSA limits above
+df_ci_se <- get_ci_se(l_params_all)
+v_ci <- df_ci_se$pars[!is.na(df_ci_se$lower)]
+stopifnot(isTRUE(all.equal(df_ci_se$lower[match(v_ci, df_ci_se$pars)], df_owsa_lit$min[match(v_ci, df_owsa_lit$pars)], tolerance = 1e-6)),
+          isTRUE(all.equal(df_ci_se$upper[match(v_ci, df_ci_se$pars)], df_owsa_lit$max[match(v_ci, df_owsa_lit$pars)], tolerance = 1e-6)))
+knitr::kable(df_owsa_lit[, c("pars", "base", "min", "max", "source")], digits = 4,
+             caption = "One-way sensitivity analysis ranges and sources")
+```
+
+
+
+```{r, results='hide', message=FALSE, warning=FALSE,verbose = FALSE}
+options(scipen = 999) # disabling scientific notation in R
+
+# make sure the base case is never a hair outside its own range (floating-point)
+df_owsa_lit$min <- pmin(df_owsa_lit$min, df_owsa_lit$base)
+df_owsa_lit$max <- pmax(df_owsa_lit$max, df_owsa_lit$base)
+
+# dataframe with the parameters and their min and max values (from the literature, above)
+df_params_owsa <- df_owsa_lit[, c("pars", "min", "max")]
+
+invisible(capture.output(
+  owsa_nmb <- run_owsa_det(
+    params_range    = df_params_owsa,
+    params_basecase = l_params_all,
+    nsamp           = 100,
+    FUN             = calculate_ce_out,
+    outcomes        = c("NMB"),
+    strategies      = v_names_str,
+    n_wtp           = 50000
+  )
+))        
+```
+
+```{r}
+plot(owsa_nmb, txtsize = 10, n_x_ticks = 4, 
+     facet_scales = "free") +
+     theme(legend.position = "bottom")
+```
+
+### 10.2.1 Optimal strategy with OWSA
+
+```{r}
+owsa_opt_strat(owsa = owsa_nmb, txtsize = 10)
+```
+
+### 10.2.2 Tornado plot
+
+A tornado of the incremental NMB (transplant − dialysis) is the more useful plot, so we build it directly from the OWSA results below.
+
+```{r tornado-incremental}
+# OWSA results in long format: parameter, strategy, param_val, outcome_val (NMB)
+df_owsa <- as.data.frame(owsa_nmb)
+v_str_owsa <- unique(df_owsa$strategy)          # strategy labels as stored by run_owsa_det()
+                                                # (dialysis first, transplant second)
+# One row per parameter value, one column per strategy
+df_owsa_w <- tidyr::pivot_wider(df_owsa[, c("parameter", "param_val", "strategy", "outcome_val")],
+                                names_from = strategy, values_from = outcome_val)
+# Incremental NMB of transplant vs dialysis at each parameter value
+df_owsa_w$inc_nmb <- df_owsa_w[[v_str_owsa[2]]] - df_owsa_w[[v_str_owsa[1]]]
+
+# Base-case incremental NMB (about 315,626)
+n_inc_nmb_base <- df_ce$NMB[2] - df_ce$NMB[1]
+
+# For each parameter: incremental NMB at the lowest and highest value tested
+df_tornado <- df_owsa_w %>%
+  group_by(parameter) %>%
+  summarise(low  = inc_nmb[which.min(param_val)],
+            high = inc_nmb[which.max(param_val)],
+            .groups = "drop") %>%
+  mutate(width = abs(high - low)) %>%
+  arrange(width) %>%
+  mutate(parameter = factor(parameter, levels = parameter))   # widest bar at the top
+
+# Long format: one bar from the base case to the low value, one to the high value
+df_tornado_long <- tidyr::pivot_longer(df_tornado, cols = c(low, high),
+                                       names_to = "Level", values_to = "inc_nmb")
+df_tornado_long$Level <- factor(df_tornado_long$Level, levels = c("low", "high"),
+                                labels = c("Low value", "High value"))
+
+gg_tornado <- ggplot(df_tornado_long) +
+  geom_segment(aes(x = n_inc_nmb_base, xend = inc_nmb,
+                   y = parameter, yend = parameter, colour = Level),
+               linewidth = 6) +
+  geom_vline(xintercept = n_inc_nmb_base, linetype = "dashed") +   # base case
+  geom_vline(xintercept = 0, colour = "red") +                     # transplant and dialysis equal
+  scale_colour_manual(values = c("Low value" = "#1F7A8C", "High value" = "#E08E0B")) +
+  scale_x_continuous(labels = scales::dollar) +
+  labs(x = "Incremental NMB, transplant vs dialysis ($50,000/QALY)",
+       y = NULL, colour = "Parameter value") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+gg_tornado
+# Dashed line = base case. Red line = 0: a bar crossing it would mean dialysis
+# becomes preferred. No bar crosses it; dialysis cost (c_dial) has the widest bar.
+df_tornado[order(-df_tornado$width), ]   # the numbers behind the plot
+
+# Alternative: with the GitHub version of dampack
+# (remotes::install_github("DARTH-git/dampack")) the built-in function plots the
+# incremental NMB directly:
+# owsa_tornado(owsa = owsa_nmb, select_str = v_names_str, outcome_name = "NMB")
+```
+
+
+
+### 10.2.3 One-way sensitivity table and threshold analysis (addition)
+
+Here we wanted tro find out, how far would each input have to move before the decision flips to dialysis. 
+
+```{r threshold-analysis}
+n_wtp_thr <- 50000   # $ per QALY
+
+# Readable labels for tables and plots
+v_par_labels <- c(
+  r_dial_exc             = "Extra death rate on dialysis (/year)",
+  hr_early               = "HR of death, graft months 1-3 vs dialysis",
+  r_GL_y1                = "Graft-loss rate, months 1-12 (/year)",
+  r_G_exc                = "Extra death rate with a graft, month 4+ (/year)",
+  r_GL_y2p               = "Graft-loss rate, month 13+ (/year)",
+  p_GL_dead_annual       = "Death in first year after graft loss",
+  u_dial                 = "Utility, dialysis",
+  early_utility_fraction = "Utility gain in graft months 1-3 (fraction)",
+  u_graft                = "Utility, functioning graft",
+  c_dial                 = "Cost of dialysis (/month)",
+  c_G1to3                = "Cost, graft months 1-3 (/month)",
+  c_G4to12               = "Cost, graft months 4-12 (/month)",
+  c_G13p                 = "Cost, graft month 13+ (/month)",
+  c_tx_once              = "Cost of transplant (one-time)",
+  d_c                    = "Discount rate, costs",
+  d_e                    = "Discount rate, QALYs",
+  n_cycles               = "Time horizon (months)")
+
+# Incremental NMB (transplant - dialysis) with ONE parameter changed
+f_inc_nmb <- function(par, val) {
+  l <- l_params_all
+  l[[par]] <- val
+  ce <- calculate_ce_out(l, n_wtp = n_wtp_thr)
+  ce$NMB[2] - ce$NMB[1]
+}
+
+# Values each parameter can logically take (where the threshold is searched)
+f_domain <- function(par, base) {
+  if (grepl("^c_", par))                                  return(c(0, 50 * base))
+  if (grepl("^u_|^p_|^early_utility_fraction$", par))     return(c(1e-6, 1 - 1e-6))
+  if (grepl("^r_", par))                                  return(c(1e-6, 2))
+  if (par == "hr_early")                                  return(c(0.05, 20))
+  if (par %in% c("d_c", "d_e"))                           return(c(0, 0.10))
+  stop("No search domain for ", par)
+}
+
+# Threshold: evaluate on a grid of 25 values, find where the sign changes,
+# then solve exactly with uniroot(). NA = the decision never changes.
+f_threshold <- function(par) {
+  base <- l_params_all[[par]]
+  dom  <- f_domain(par, base)
+  v_x  <- seq(dom[1], dom[2], length.out = 25)
+  v_y  <- vapply(v_x, function(x) f_inc_nmb(par, x), numeric(1))
+  k    <- which(diff(sign(v_y)) != 0)
+  if (length(k) == 0) return(c(threshold = NA, dom_lo = dom[1], dom_hi = dom[2]))
+  k    <- k[which.min(abs(v_x[k] - base))]          # crossing closest to the base case
+  root <- uniroot(function(x) f_inc_nmb(par, x), lower = v_x[k], upper = v_x[k + 1],
+                  tol = 1e-6 * max(1, abs(base)))$root
+  c(threshold = root, dom_lo = dom[1], dom_hi = dom[2])
+}
+
+v_pars_thr <- setdiff(df_owsa_lit$pars, "n_cycles")   # horizon handled below
+m_thr <- t(vapply(v_pars_thr, f_threshold, numeric(3)))
+
+df_thr <- data.frame(
+  pars        = v_pars_thr,
+  Parameter   = unname(v_par_labels[v_pars_thr]),
+  Base        = df_owsa_lit$base[match(v_pars_thr, df_owsa_lit$pars)],
+  Range_low   = df_owsa_lit$min [match(v_pars_thr, df_owsa_lit$pars)],
+  Range_high  = df_owsa_lit$max [match(v_pars_thr, df_owsa_lit$pars)],
+  IncNMB_low  = df_tornado$low  [match(v_pars_thr, as.character(df_tornado$parameter))],
+  IncNMB_high = df_tornado$high [match(v_pars_thr, as.character(df_tornado$parameter))],
+  Threshold   = m_thr[, "threshold"],
+  Dom_low     = m_thr[, "dom_lo"],
+  Dom_high    = m_thr[, "dom_hi"])
+
+# Time horizon: shortest horizon (even months) from which transplant stays cost-effective
+v_h     <- seq(2, 60, by = 2)
+v_h_nmb <- vapply(v_h, function(h) f_inc_nmb("n_cycles", h), numeric(1))
+n_breakeven_h <- if (all(v_h_nmb > 0)) 2 else v_h[max(which(v_h_nmb <= 0)) + 1]
+n_breakeven_h        # expected about 20 months (incremental NMB < 0 at 18, > 0 at 20)
+df_thr <- rbind(df_thr, data.frame(
+  pars = "n_cycles", Parameter = v_par_labels[["n_cycles"]], Base = n_cycles,
+  Range_low = 60, Range_high = n_cycles,
+  IncNMB_low  = df_tornado$low [as.character(df_tornado$parameter) == "n_cycles"],
+  IncNMB_high = df_tornado$high[as.character(df_tornado$parameter) == "n_cycles"],
+  Threshold = n_breakeven_h, Dom_low = 2, Dom_high = n_cycles))
+
+# Formatting
+f_fmt <- function(par, x) ifelse(grepl("^c_", par), scales::dollar(round(x)),
+                          ifelse(par == "n_cycles", as.character(round(x)), as.character(signif(x, 3))))
+df_thr$Within_range <- !is.na(df_thr$Threshold) &
+                       df_thr$Threshold >= df_thr$Range_low & df_thr$Threshold <= df_thr$Range_high
+df_thr$Dialysis_preferred_if <- ifelse(
+  is.na(df_thr$Threshold),
+  paste0("Never (searched ", f_fmt(df_thr$pars, df_thr$Dom_low), " to ", f_fmt(df_thr$pars, df_thr$Dom_high), ")"),
+  ifelse(df_thr$Threshold < df_thr$Base,
+         paste0("< ", f_fmt(df_thr$pars, df_thr$Threshold)),
+         paste0("> ", f_fmt(df_thr$pars, df_thr$Threshold))))
+
+df_thr_table <- data.frame(
+  Parameter                   = df_thr$Parameter,
+  `Base case`                 = f_fmt(df_thr$pars, df_thr$Base),
+  `Range`                     = paste0(f_fmt(df_thr$pars, df_thr$Range_low), " - ", f_fmt(df_thr$pars, df_thr$Range_high)),
+  `Inc. NMB at low`           = scales::dollar(round(df_thr$IncNMB_low)),
+  `Inc. NMB at high`          = scales::dollar(round(df_thr$IncNMB_high)),
+  check.names = FALSE)
+knitr::kable(df_thr_table, align = "lllrr",
+             caption = paste0("One-way sensitivity analysis and threshold values (WTP $",
+                              scales::comma(n_wtp_thr), "/QALY; base-case incremental NMB ",
+                              scales::dollar(round(n_inc_nmb_base)), ")"))
+# Expected thresholds: dialysis < $4,240/month; graft month 13+ > $8,125/month;
+# graft months 4-12 > $47,314; graft months 1-3 > $156,375; transplant > $376,668;
+# extra death rate on dialysis > 0.670/year (about 3% alive at 5 years on dialysis);
+# horizon < 20 months. No other clinical parameter or utility changes the decision.
+```
+
+```{r}
+df_thr_table <- data.frame(
+  Input       = df_thr$Parameter,
+  `Base case` = f_fmt(df_thr$pars, df_thr$Base),
+  Range       = paste0(f_fmt(df_thr$pars, df_thr$Range_low), " - ", f_fmt(df_thr$pars, df_thr$Range_high)),
+  Threshold   = ifelse(is.na(df_thr$Threshold),
+                       "-",
+                       ifelse(df_thr$Threshold < df_thr$Base,
+                              paste0("< ", f_fmt(df_thr$pars, df_thr$Threshold)),
+                              paste0("> ", f_fmt(df_thr$pars, df_thr$Threshold)))),
+  check.names = FALSE)
+
+knitr::kable(df_thr_table, align = "llll",
+             caption = paste0("One-way sensitivity analysis: base case, literature range and threshold at which ",
+                              "continued dialysis becomes preferred (WTP $", scales::comma(n_wtp_thr),
+                              "/QALY; base-case incremental NMB ", scales::dollar(round(n_inc_nmb_base)), ")"))
+```
+
+
+```{r threshold-curves, fig.width = 9, fig.height = 6}
+## Plot 2: one-way curves for the parameters that have a threshold
+# (as in the lecture, slide 60): incremental NMB across values of the
+# parameter; shaded = literature range; red line = 0 (decision changes);
+# dashed line = threshold; dot = base case.
+df_thr_yes <- subset(df_thr, !is.na(Threshold) & pars != "n_cycles")
+if (nrow(df_thr_yes) > 0) {
+  df_curves <- do.call(rbind, lapply(df_thr_yes$pars, function(p) {
+    r <- df_thr_yes[df_thr_yes$pars == p, ]
+    v_x <- seq(0.8 * min(r$Range_low, r$Threshold), 1.2 * max(r$Range_high, r$Threshold), length.out = 30)
+    data.frame(Parameter = r$Parameter, x = v_x,
+               inc_nmb = vapply(v_x, function(v) f_inc_nmb(p, v), numeric(1)))
+  }))
+  df_thr_yes$base_nmb <- n_inc_nmb_base
+  gg_thr_curves <- ggplot(df_curves, aes(x = x, y = inc_nmb)) +
+    geom_rect(data = df_thr_yes, inherit.aes = FALSE,
+              aes(xmin = Range_low, xmax = Range_high, ymin = -Inf, ymax = Inf),
+              fill = "#1F7A8C", alpha = 0.2) +
+    geom_hline(yintercept = 0, colour = "#C0392B") +
+    geom_line(linewidth = 0.8) +
+    geom_vline(data = df_thr_yes, aes(xintercept = Threshold), linetype = "dashed") +
+    geom_point(data = df_thr_yes, aes(x = Base, y = base_nmb), size = 2.5) +
+    facet_wrap(~ Parameter, scales = "free_x") +
+    scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)) +   # costs and rates share this axis style
+    scale_y_continuous(labels = scales::dollar) +
+    labs(x = "Parameter value", y = "Incremental NMB, transplant vs dialysis",
+         title = "One-way threshold analysis (parameters with a threshold)") +
+    theme_bw(base_size = 11)
+  gg_thr_curves
+}
+
+## Plot 3: time horizon
+gg_thr_h <- ggplot(data.frame(h = c(v_h, n_cycles), nmb = c(v_h_nmb, n_inc_nmb_base)), aes(h, nmb)) +
+  geom_hline(yintercept = 0, colour = "#C0392B") +
+  geom_line() + geom_point(size = 1.5) +
+  geom_vline(xintercept = n_breakeven_h, linetype = "dashed") +
+  annotate("text", x = n_breakeven_h, y = max(v_h_nmb), hjust = -0.1, size = 3.5,
+           label = paste0("Transplant cost-effective from a ", n_breakeven_h, "-month horizon")) +
+  scale_x_continuous(limits = c(0, 62)) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(x = "Time horizon (months)", y = "Incremental NMB, transplant vs dialysis",
+       title = "Incremental NMB by time horizon (first 5 years)") +
+  theme_bw(base_size = 11)
+gg_thr_h
+```
+## 10.3 Two-way sensitivity analysis (TWSA)
+
+Dialysis cost per month vs graft follow-up cost per month (month 13+).
+
+```{r}
+## Fixed colours and labels for all two-way plots
+v_twsa_fill <- c("Continued.dialysis" = "#6C5B7B",
+                 "ECD.DCD.transplant" = "#1F7A8C")
+v_twsa_lab  <- c("Continued.dialysis" = "Continued dialysis",
+                 "ECD.DCD.transplant" = "ECD/DCD transplant")
+```
+
+```{r, results='hide'}
+# Row 1 = x-axis (c_dial), row 2 = y-axis (c_G13p); literature ranges from section 10.2
+df_params_twsa <- df_params_owsa[df_params_owsa$pars %in% c("c_dial", "c_G13p"), ]
+
+twsa_nmb <- run_twsa_det(params_range    = df_params_twsa,
+                         params_basecase = l_params_all,
+                         nsamp           = 40,
+                         FUN             = calculate_ce_out,
+                         outcomes        = "NMB",
+                         strategies      = v_names_str,
+                         n_wtp           = 50000)
+```
+
+### 10.3.1 Plot TWSA
+
+```{r}
+plot(twsa_nmb) +
+  scale_fill_manual(values = v_twsa_fill, labels = v_twsa_lab, drop = FALSE) +
+  labs(x = "Dialysis cost per month ($)",
+       y = "Graft follow-up cost per month, month 13+ ($)",
+       fill = "Strategy")
+# One colour expected: transplant optimal across the literature ranges.
+```
+
+### 10.3.2 TWSA with wider ranges to show the threshold
+
+```{r twsa-wide, results='hide'}
+# Break-even: dialysis about $4,240/month at base graft cost ($3,272);
+# graft cost about $8,125/month at base dialysis cost ($8,929).
+df_params_twsa_wide <- data.frame(pars = c("c_dial", "c_G13p"),
+                                  min  = c(2000,     1500),
+                                  max  = c(12500,    9000))
+twsa_nmb_wide <- run_twsa_det(params_range    = df_params_twsa_wide,
+                              params_basecase = l_params_all,
+                              nsamp           = 40,
+                              FUN             = calculate_ce_out,
+                              outcomes        = "NMB",
+                              strategies      = v_names_str,
+                              n_wtp           = 50000)
+```
+
+```{r}
+plot(twsa_nmb_wide) +
+  scale_fill_manual(values = v_twsa_fill, labels = v_twsa_lab, drop = FALSE) +
+  labs(x = "Dialysis cost per month ($)",
+       y = "Graft follow-up cost per month, month 13+ ($)",
+       fill = "Strategy") +
+  annotate("point", x = l_params_all$c_dial, y = l_params_all$c_G13p,
+           shape = 4, size = 4, stroke = 1.5)   # base case
+```
+
+# **11 Probabilistic Sensitivity Analysis (PSA)**
+
+## 11.1 Model input
+
+Here we used SE from CI or 10% of mean base values to calculate scale and shape for PSA. Beta distribution was used to make values between 0 and 1. Gamma distirbution was used for parameters that can take values from 0 to infinity. 
+
+```{r}
+# Store the parameter names into a vector
+v_names_params <- names(l_params_all)
+
+## Test functions to generate CE outcomes and PSA dataset 
+# Test function to compute CE outcomes
+calculate_ce_out(l_params_all) 
+
+# PSA distributions, standard errors and their basis (method of moments)
+options(knitr.kable.NA = "-")
+
+knitr::kable(get_sa_spec(l_params_all)[, c("pars", "mean", "se", "distribution", "shape", "scale", "alpha", "beta", "basis")],
+             digits = 5, caption = "PSA distributions")
+
+# Test function to generate PSA input dataset
+generate_psa_params(n_sim = 10) 
+
+## Generate PSA dataset 
+# Number of simulations
+n_sim <- 1000
+
+# Generate PSA input dataset
+df_psa_input <- generate_psa_params(n_sim = n_sim, params_basecase = l_params_all)
+# First six observations
+head(df_psa_input)
+
+### Histogram of parameters 
+ggplot(melt(df_psa_input, variable.name = "Parameter"), aes(x = value)) +
+  facet_wrap(~Parameter, scales = "free") +
+  geom_histogram(aes(y = after_stat(density))) +
+  ylab("") +
+  theme_bw(base_size = 16) + 
+  theme(axis.text = element_text(size = 6),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank()) 
+```
+
+## 11.2 Run PSA
+
+```{r}
+# Initialize data.frames with PSA output 
+# data.frame of costs
+df_c <- as.data.frame(matrix(0, 
+                             nrow = n_sim,
+                             ncol = n_str))
+colnames(df_c) <- v_names_str
+# data.frame of effectiveness
+df_e <- as.data.frame(matrix(0, 
+                             nrow = n_sim,
+                             ncol = n_str))
+colnames(df_e) <- v_names_str
+
+# Conduct probabilistic sensitivity analysis
+# Run Markov model on each parameter set of PSA input dataset
+n_time_init_psa_series <- Sys.time()
+for (i in 1:n_sim) { # i <- 1
+  l_psa_input <- update_param_list(l_params_all, as.list(df_psa_input[i,]))
+  # Outcomes
+  l_out_ce_temp  <- calculate_ce_out(l_psa_input)
+  df_c[i, ]  <- l_out_ce_temp$Cost  
+  df_e[i, ]  <- l_out_ce_temp$Effect
+  # Display simulation progress
+  if (i/(n_sim/100) == round(i/(n_sim/100), 0)) { # display progress every 5%
+    cat('\r', paste(i/n_sim * 100, "% done", sep = " "))
+  }
+}
+n_time_end_psa_series <- Sys.time()
+n_time_total_psa_series <- n_time_end_psa_series - n_time_init_psa_series
+print(paste0("PSA with ", scales::comma(n_sim), " simulations run in series in ", 
+             round(n_time_total_psa_series, 2), " ", 
+             units(n_time_total_psa_series)))
+```
+
+# 11.3 Visualize PSA results for CEA
+
+```{r}
+### Create PSA object 
+l_psa <- make_psa_obj(cost          = df_c, 
+                      effectiveness = df_e, 
+                      parameters    = df_psa_input, 
+                      strategies    = v_names_str)
+l_psa$strategies <- v_names_str
+colnames(l_psa$effectiveness) <- v_names_str
+colnames(l_psa$cost) <- v_names_str
+
+# Vector with willingness-to-pay (WTP) thresholds.
+v_wtp <- seq(0, 150000, by = 5000)
+```
+
+## 11.3.1 Cost-Effectiveness Scatter plot
+
+```{r}
+### Cost-Effectiveness Scatter plot 
+txtsize <- 13
+gg_scattter <- plot_psa(l_psa, txtsize = txtsize) +
+  ggthemes::scale_color_colorblind() +
+  ggthemes::scale_fill_colorblind() +
+  scale_y_continuous("Cost (Thousand $)", 
+                     breaks = number_ticks(10),
+                     labels = function(x) x/1000) +
+  xlab("Effectiveness (QALYs)") +
+  guides(col = guide_legend(nrow = 2)) +
+  theme(legend.position = "bottom")
+gg_scattter
+```
+
+### 11.3.1b Incremental cost-effectiveness plane with WTP line (addition)
+
+```{r ce-plane-incremental}
+# plot_psa() above shows ABSOLUTE costs and QALYs of each strategy, so a
+# willingness-to-pay line cannot be drawn on it. Here each PSA draw is one
+# point: transplant minus dialysis.
+n_wtp_plane <- 50000                                    # $ per QALY
+df_inc_psa <- data.frame(inc_qaly = df_e[[v_names_str[2]]] - df_e[[v_names_str[1]]],
+                         inc_cost = df_c[[v_names_str[2]]] - df_c[[v_names_str[1]]])
+# Cost-effective at the threshold = point lies below the WTP line
+# (inc_cost < WTP x inc_qaly), i.e. incremental NMB > 0
+df_inc_psa$cost_effective <- df_inc_psa$inc_cost < n_wtp_plane * df_inc_psa$inc_qaly
+
+# Share of draws in each quadrant and below the line
+v_share <- c(
+  cost_effective_at_WTP = mean(df_inc_psa$cost_effective),
+  dominant              = mean(df_inc_psa$inc_cost < 0 & df_inc_psa$inc_qaly > 0),  # cheaper and better (SE quadrant)
+  more_costly_better    = mean(df_inc_psa$inc_cost > 0 & df_inc_psa$inc_qaly > 0),  # NE quadrant
+  cheaper_worse         = mean(df_inc_psa$inc_cost < 0 & df_inc_psa$inc_qaly < 0),  # SW quadrant
+  dominated             = mean(df_inc_psa$inc_cost > 0 & df_inc_psa$inc_qaly < 0))  # NW quadrant
+round(v_share, 3)
+
+gg_plane <- ggplot(df_inc_psa, aes(x = inc_qaly, y = inc_cost)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_point(aes(colour = cost_effective), alpha = 0.4, size = 1.2) +
+  stat_ellipse(level = 0.95, type = "norm", linewidth = 0.8) +    # 95% confidence ellipse
+  geom_point(aes(x = mean(inc_qaly), y = mean(inc_cost)), size = 3, shape = 4) +  # mean
+  geom_abline(intercept = 0, slope = n_wtp_plane, linetype = "dashed") +           # WTP line
+  annotate("label", x = max(df_inc_psa$inc_qaly), y = n_wtp_plane * max(df_inc_psa$inc_qaly),
+           label = "WTP = $50,000/QALY", hjust = 1, size = 3.5) +
+  scale_colour_manual(values = c(`TRUE` = "#1F7A8C", `FALSE` = "#E08E0B"),
+                      labels = c(`TRUE` = "Cost-effective", `FALSE` = "Not cost-effective"),
+                      name = NULL) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(x = "Incremental QALYs (transplant vs dialysis)",
+       y = "Incremental cost (transplant vs dialysis)",
+       title = "Incremental cost-effectiveness plane, ECD/DCD transplant vs continued dialysis") +
+  coord_cartesian(ylim = range(c(df_inc_psa$inc_cost, 0, n_wtp_plane * max(df_inc_psa$inc_qaly))),   # include the top of the WTP line so its label shows
+                  xlim = range(c(df_inc_psa$inc_qaly, 0))) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+gg_plane
+```
+
+## 11.3.2 Incremental cost-effectiveness ratios (ICERs) with probabilistic output
+
+```{r}
+### Incremental cost-effectiveness ratios (ICERs) with probabilistic output 
+# Compute expected costs and effects for each strategy from the PSA
+df_out_ce_psa <- summary(l_psa)
+df_cea_psa <- calculate_icers(cost       = df_out_ce_psa$meanCost, 
+                              effect     = df_out_ce_psa$meanEffect,
+                              strategies = df_out_ce_psa$Strategy)
+df_cea_psa
+```
+
+## 11.3.3 Plot cost-effectiveness frontier with probabilistic output
+
+```{r}
+### Plot cost-effectiveness frontier with probabilistic output 
+plot_icers(df_cea_psa, label = "all", txtsize = txtsize) +
+  expand_limits(x = max(table_cea$QALYs) + 0.1) +
+  theme(legend.position = c(0.8, 0.3))
+```
+
+## 11.3.4 Cost-effectiveness acceptability curves (CEACs) and frontier (CEAF)
+
+```{r}
+### Cost-effectiveness acceptability curves (CEACs) and frontier (CEAF) 
+ceac_obj <- ceac(wtp = v_wtp, psa = l_psa)
+# Regions of highest probability of cost-effectiveness for each strategy
+summary(ceac_obj)
+# CEAC & CEAF plot
+gg_ceac <- plot_ceac(ceac_obj, txtsize = txtsize, xlim = c(0, NA), n_x_ticks = 14) +
+  ggthemes::scale_color_colorblind() +
+  ggthemes::scale_fill_colorblind() +
+  theme(legend.position = c(0.8, 0.48))
+gg_ceac
+```
+
+## 11.3.5 Expected Loss Curves (ELCs)
+
+```{r}
+### Expected Loss Curves (ELCs) 
+elc_obj <- calc_exp_loss(wtp = v_wtp, psa = l_psa)
+elc_obj
+
+# ELC plot
+gg_elc <- plot_exp_loss(elc_obj, log_y = FALSE, 
+               txtsize = txtsize, xlim = c(0, NA), n_x_ticks = 14,
+               col = "full") +
+  ggthemes::scale_color_colorblind() +
+  ggthemes::scale_fill_colorblind() +
+  # geom_point(aes(shape = as.name("Strategy"))) +
+  scale_y_continuous("Expected Loss (Thousand $)", 
+                     breaks = number_ticks(10),
+                     labels = function(x) x/1000) +
+  theme(legend.position = c(0.4, 0.7),)
+gg_elc
+```
+
+## 11.3.6 Expected value of perfect information (EVPI)
+
+```{r}
+### Expected value of perfect information (EVPI) 
+evpi <- calc_evpi(wtp = v_wtp, psa = l_psa)
+# EVPI plot
+gg_evpi <- plot_evpi(evpi, effect_units = "QALY", 
+                     txtsize = txtsize, xlim = c(0, NA), n_x_ticks = 14) +
+  scale_y_continuous("EVPI (Thousand $)", 
+                     breaks = number_ticks(10),
+                     labels = function(x) x/1000)
+gg_evpi
+```
+
+# 12 Save sensitivity-analysis results (addition to template)
+
+```{r save-results}
+# write.csv(df_ce, file.path(results_dir,"base_case.csv"),row.names=FALSE)
+# write.csv(get_sa_spec(l_params_all),file.path(results_dir,"parameter_distributions.csv"),row.names=FALSE)
+# write.csv(df_params_owsa,file.path(results_dir,"owsa_ranges.csv"),row.names=FALSE)
+# write.csv(df_psa_input,file.path(results_dir,"psa_inputs.csv"),row.names=FALSE)
+# write.csv(df_c,file.path(results_dir,"psa_costs.csv"),row.names=FALSE)
+# write.csv(df_e,file.path(results_dir,"psa_qalys.csv"),row.names=FALSE)
+# write.csv(df_cea_psa,file.path(results_dir,"psa_cea.csv"),row.names=FALSE)
+# saveRDS(list(params=l_params_all,owsa=owsa_nmb,twsa=twsa_nmb,twsa_wide=twsa_nmb_wide,
+#              psa=l_psa,ceac=ceac_obj,elc=elc_obj,evpi=evpi),
+#         file.path(results_dir,"sa_results.rds"))
+# ggsave(file.path(results_dir,"psa_scatter.png"),gg_scattter,width=9,height=6)
+# ggsave(file.path(results_dir,"ce_plane_incremental.png"),gg_plane,width=9,height=6)   
+# ggsave(file.path(results_dir,"ceac.png"),gg_ceac,width=9,height=6)
+# ggsave(file.path(results_dir,"expected_loss.png"),gg_elc,width=9,height=6)
+# ggsave(file.path(results_dir,"evpi.png"),gg_evpi,width=9,height=6)
+# ggsave(file.path(results_dir,"tornado.png"),gg_tornado,width=10,height=8)
+# write.csv(df_thr_table,file.path(results_dir,"owsa_threshold_table.csv"),row.names=FALSE)  
+# ggsave(file.path(results_dir,"threshold_horizon.png"),gg_thr_h,width=8,height=5)  
+# writeLines(capture.output(sessionInfo()),file.path(results_dir,"sessionInfo.txt"))
+```
+
+
+# References
+
+1.  Hellemans R, Chesnaye NC, Kramer A, et al. Survival benefit of
+    deceased donor kidney transplantation versus continued dialysis:
+    international target trial emulation. *BMJ*. 2026;394:e100624.
+    doi:10.1136/bmj-2026-100624
+2.  Leeaphorn N, et al. Deceased donor kidney transplantation versus
+    continued dialysis among patients aged 75 years or older: a target
+    trial emulation. *Am J Kidney Dis*. 2026.
+    doi:10.1053/j.ajkd.2026.02.647 [full author list to be added]
+3.  Schachtner T, Otto NM, Reinke P. Two decades of the Eurotransplant
+    Senior Program: the gender gap in mortality impacts patient survival
+    after kidney transplantation. *Clin Kidney J*. 2020;13(6):1091-1100.
+    doi:10.1093/ckj/sfz118
+4.  Vanhove T, Elias N, Safa K, et al. Long-term outcome reporting in
+    older kidney transplant recipients and the limitations of
+    conventional survival metrics. *Kidney Int Rep*.
+    2022;7(11):2397-2409. doi:10.1016/j.ekir.2022.08.010
+5.  Ferguson TW, Whitlock RH, Bamforth RJ, et al. Cost-utility of
+    dialysis in Canada: hemodialysis, peritoneal dialysis, and
+    nondialysis treatment of kidney failure. *Kidney Med*.
+    2021;3(1):20-30.e1. doi:10.1016/j.xkme.2020.07.011
+6.  Barnieh L, Manns BJ, Klarenbach S, McLaughlin K, Yilmaz S,
+    Hemmelgarn BR. A description of the costs of living and standard
+    criteria deceased donor kidney transplantation. *Am J Transplant*.
+    2011;11(3):478-488. doi:10.1111/j.1600-6143.2010.03425.x
+7.  Statistics Canada. Consumer Price Index, annual average, not
+    seasonally adjusted. Table 18-10-0005-01.
+    doi:10.25318/1810000501-eng
+8.  Wyld M, Morton RL, Hayen A, Howard K, Webster AC. A systematic
+    review and meta-analysis of utility-based quality of life in chronic
+    kidney disease treatments. *PLoS Med*. 2012;9(9):e1001307.
+    doi:10.1371/journal.pmed.1001307
+9.  CADTH. *Guidelines for the Economic Evaluation of Health
+    Technologies: Canada*. 4th ed. CADTH; 2017.
+10. Alarid-Escudero F, Krijkamp EM, Enns EA, et al. A tutorial on
+    time-dependent cohort state-transition models in R using a
+    cost-effectiveness analysis example. *Med Decis Making*.
+    2023;43(1):21-41. doi:10.1177/0272989X221121747
+11. Li B, Cairns JA, Draper H, et al. Estimating health-state utility
+    values in kidney transplant recipients and waiting-list patients
+    using the EQ-5D-5L. *Value Health*. 2017;20(7):976-984.
+    doi:10.1016/j.jval.2017.01.011
+12. Laupacis A, Keown P, Pus N, et al. A study of the quality of life
+    and cost-utility of renal transplantation. *Kidney Int*.
+    1996;50(1):235-242. doi:10.1038/ki.1996.307
+13. Perez-Saez MJ, Juega J, Zapatero A, et al. Kidney transplant
+    outcomes in elderly recipients with controlled donation after
+    circulatory death or donation after brain death donors: a registry
+    cohort study. *Transpl Int*. 2021;34(12):2507-2514.
+    doi:10.1111/tri.14141
+14. Perez-Saez MJ, Lafuente Covarrubias O, Hernandez D, et al. Early
+    outcomes of kidney transplantation from elderly donors after
+    circulatory death (GEODAS study). *BMC Nephrol*. 2019;20(1):233.
+    doi:10.1186/s12882-019-1412-0
+15. **[NEW – ageing]** Statistics Canada. Table 13-10-0114-01. Life
+    expectancy and other elements of the complete life table, three-year
+    estimates, Canada, all provinces except Prince Edward Island
+    (2022/2024, preliminary). Released January 13, 2026.
+    doi:10.25318/1310011401-eng
+16. **[NEW]** Summers DM, Watson CJE, Pettigrew GJ, et al. Kidney
+    donation after circulatory death (DCD): state of the art. *Kidney
+    Int*. 2015;88(2):241-249. doi:10.1038/ki.2015.88
+
+17. **[NEW – SA]** de Boer SE, Tegzess E, Kremer D, Bemelman FJ, et al.
+    Comparable outcomes for old, older, and very old deceased donors in
+    old kidney transplant recipients. *Am J Transplant*. 2026;26(5).
+    [pages and DOI to be added]
+18. **[NEW – SA]** Bamforth RJ, Beaudry A, Ferguson TW, et al. Costs of
+    assisted home dialysis: a single-payer Canadian model from Manitoba.
+    *Kidney Med*. 2021;3(6):942-950.e1. doi:10.1016/j.xkme.2021.04.019
+
+# Acknowlegdement
+
+For this work we made use of the template developed by the Decision
+Analysis in R for Technologies in Health (DARTH) workgroup:
+<http://darthworkgroup.com>.
+
+The notation of our code is based on the following provided framework
+and coding convention: Alarid-Escudero, F., Krijkamp, E.,
+Pechlivanoglou, P. et al. A Need for Change! A Coding Framework for
+Improving Transparency in Decision Modeling. PharmacoEconomics 37,
+1329–1339 (2019). <https://doi.org/10.1007/s40273-019-00837-x>.
+
+- Alarid-Escudero F, Krijkamp EM, Enns EA, Yang A, Hunink MGM
+  Pechlivanoglou P, Jalal H. An Introductory Tutorial on Cohort
+  State-Transition Models in R Using a Cost-Effectiveness Analysis
+  Example. Medical Decision Making, 2023; 43(1). (Epub).
+  <https://doi.org/10.1177/0272989X221103163>
+
+- Alarid-Escudero F, Krijkamp EM, Enns EA, Yang A, Hunink MGM
+  Pechlivanoglou P, Jalal H. A Tutorial on Time-Dependent Cohort
+  State-Transition Models in R using a Cost-Effectiveness Analysis
+  Example. Medical Decision Making, 2023; 43(1).
+  <https://doi.org/10.1177/0272989X221121747>
+
+Other work from DARTH can be found on the website:
+<http://darthworkgroup.com/publications/>
+
+# Copyright for assignment work
+
+Copyright 2017, THE HOSPITAL FOR SICK CHILDREN AND THE COLLABORATING
+INSTITUTIONS.All rights reserved in Canada, the United States and
+worldwide. Copyright, trademarks, trade names and any and all associated
+intellectual property are exclusively owned by THE HOSPITAL FOR Sick
+CHILDREN and the collaborating institutions. These materials may be
+used, reproduced, modified, distributed and adapted with proper
+attribution.
